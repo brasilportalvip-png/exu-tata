@@ -57,3 +57,54 @@ test("o login devolve JSON controlado em vez de FUNCTION_INVOCATION_FAILED", asy
   assert.equal(response.status, 401);
   assert.equal(typeof body.error, "string");
 });
+
+test("o health em produção rejeita status ok e devolve 503 degraded se o Firebase Admin estiver ausente", async () => {
+  const prevEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "production";
+    const response = await requestFromTemporaryServer("/api/health");
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.equal(body.status, "degraded");
+    assert.equal(body.services.firebaseAdmin, "unconfigured");
+    assert.ok(Array.isArray(body.missingVariables));
+  } finally {
+    process.env.NODE_ENV = prevEnv;
+  }
+});
+
+test("o endpoint de recuperação de senha valida e responde com JSON controlado", async () => {
+  const response = await requestFromTemporaryServer("/api/auth/reset-password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "buscador@teste.com" })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.success, true);
+  assert.equal(typeof body.message, "string");
+});
+
+test("os oráculos privados e caros exigem autenticação válida", async () => {
+  const astroRes = await requestFromTemporaryServer("/api/oraculo/astrologia", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ birthDate: "1990-05-15" })
+  });
+  assert.equal(astroRes.status, 401);
+
+  const buyRes = await requestFromTemporaryServer("/api/credits/buy", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ planId: "prata" })
+  });
+  assert.equal(buyRes.status, 401);
+
+  const adminRes = await requestFromTemporaryServer("/api/admin/users", {
+    method: "GET"
+  });
+  assert.equal(adminRes.status, 401);
+});
+

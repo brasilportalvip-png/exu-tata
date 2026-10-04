@@ -11,6 +11,7 @@ import {
 } from "firebase/auth";
 
 const env = (import.meta as any).env || {};
+const isProduction = Boolean(env.PROD || env.MODE === "production");
 
 const firebaseConfig = {
   apiKey: env.VITE_FIREBASE_API_KEY || "",
@@ -21,7 +22,7 @@ const firebaseConfig = {
   appId: env.VITE_FIREBASE_APP_ID || "",
 };
 
-const isFirebaseConfigured = Boolean(
+export const isFirebaseConfigured = Boolean(
   firebaseConfig.apiKey && firebaseConfig.projectId
 );
 
@@ -34,8 +35,7 @@ export interface MockFirebaseUser {
   delete: () => Promise<void>;
 }
 
-const MOCK_STORAGE_KEY = "exu_mock_firebase_user";
-const MOCK_ACCOUNTS_KEY = "exu_mock_firebase_accounts";
+const MOCK_STORAGE_KEY = "exu_dev_user_session";
 
 type AuthListener = (user: MockFirebaseUser | null) => void;
 const listeners = new Set<AuthListener>();
@@ -50,6 +50,9 @@ function createMockUserObject(data: {
     email: data.email,
     emailVerified: data.emailVerified,
     async getIdToken() {
+      if (isProduction) {
+        throw new Error("Mock token is strictly forbidden in production.");
+      }
       return btoa(
         JSON.stringify({
           uid: this.uid,
@@ -62,15 +65,17 @@ function createMockUserObject(data: {
       this.emailVerified = true;
     },
     async delete() {
-      localStorage.removeItem(MOCK_STORAGE_KEY);
-      mockAuth.currentUser = null;
+      if (typeof window !== "undefined") {
+        localStorage.removeItem(MOCK_STORAGE_KEY);
+      }
+      devAuth.currentUser = null;
       notifyListeners();
     },
   };
 }
 
-function loadStoredMockUser(): MockFirebaseUser | null {
-  if (typeof window === "undefined") return null;
+function loadStoredDevUser(): MockFirebaseUser | null {
+  if (isProduction || typeof window === "undefined") return null;
   try {
     const raw = localStorage.getItem(MOCK_STORAGE_KEY);
     if (!raw) return null;
@@ -79,50 +84,26 @@ function loadStoredMockUser(): MockFirebaseUser | null {
       return createMockUserObject({
         uid: parsed.uid,
         email: parsed.email,
-        emailVerified: true,
+        emailVerified: parsed.emailVerified !== false,
       });
     }
   } catch {
-    // ignore storage errors
+    // Ignore invalid stored session
   }
   return null;
 }
 
-function loadMockAccounts(): Record<
-  string,
-  { uid: string; email: string; password: string }
-> {
-  if (typeof window === "undefined") return {};
-  try {
-    const raw = localStorage.getItem(MOCK_ACCOUNTS_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveMockAccounts(
-  accounts: Record<string, { uid: string; email: string; password: string }>
-) {
-  if (typeof window === "undefined") return;
-  try {
-    localStorage.setItem(MOCK_ACCOUNTS_KEY, JSON.stringify(accounts));
-  } catch {
-    // ignore
-  }
-}
-
-const mockAuth: {
+const devAuth: {
   currentUser: MockFirebaseUser | null;
   languageCode: string | null;
 } = {
-  currentUser: loadStoredMockUser(),
+  currentUser: isProduction ? null : loadStoredDevUser(),
   languageCode: "pt-BR",
 };
 
 function notifyListeners() {
   for (const listener of listeners) {
-    listener(mockAuth.currentUser);
+    listener(devAuth.currentUser);
   }
 }
 
@@ -134,11 +115,19 @@ if (isFirebaseConfigured) {
     app = initializeApp(firebaseConfig);
     realAuth = getAuth(app);
   } catch (err) {
-    console.warn("[AI Studio] Failed to initialize Firebase client, using mock auth:", err);
+    console.error("[Firebase] Falha ao inicializar Firebase Auth do cliente:", err);
   }
 }
 
-export const auth: Auth = (realAuth || (mockAuth as unknown as Auth));
+// In production, NEVER use mock auth fallback.
+export const auth: Auth = realAuth
+  ? realAuth
+  : isProduction
+  ? ({
+      currentUser: null,
+      languageCode: "pt-BR",
+    } as unknown as Auth)
+  : (devAuth as unknown as Auth);
 
 export function onAuthStateChanged(
   authInstance: Auth,
@@ -147,8 +136,13 @@ export function onAuthStateChanged(
   if (realAuth) {
     return fbOnAuthStateChanged(authInstance, callback);
   }
+  if (isProduction) {
+    // Production without Firebase: always unauthenticated
+    setTimeout(() => callback(null), 0);
+    return () => {};
+  }
   listeners.add(callback);
-  setTimeout(() => callback(mockAuth.currentUser), 0);
+  setTimeout(() => callback(devAuth.currentUser), 0);
   return () => {
     listeners.delete(callback);
   };
@@ -158,10 +152,13 @@ export async function signOut(authInstance: Auth): Promise<void> {
   if (realAuth) {
     return fbSignOut(authInstance);
   }
+  if (isProduction) {
+    return;
+  }
   if (typeof window !== "undefined") {
     localStorage.removeItem(MOCK_STORAGE_KEY);
   }
-  mockAuth.currentUser = null;
+  devAuth.currentUser = null;
   notifyListeners();
 }
 
@@ -173,6 +170,13 @@ export async function createUserWithEmailAndPassword(
   if (realAuth) {
     return fbCreateUserWithEmailAndPassword(authInstance, email, password);
   }
+  if (isProduction) {
+    throw new Error(
+      "Serviço de autenticação temporariamente indisponível. Firebase Authentication não está configurado neste ambiente."
+    );
+  }
+
+  // Development/Test mock only — NEVER store password
   const normalizedEmail = email.trim().toLowerCase();
   if (!normalizedEmail.includes("@")) {
     const err: any = new Error("Invalid email");
@@ -184,26 +188,18 @@ export async function createUserWithEmailAndPassword(
     err.code = "auth/weak-password";
     throw err;
   }
-  const accounts = loadMockAccounts();
-  if (accounts[normalizedEmail]) {
-    const err: any = new Error("Email already in use");
-    err.code = "auth/email-already-in-use";
-    throw err;
-  }
-  const uid = "mock_uid_" + Math.random().toString(36).substring(2, 11);
-  accounts[normalizedEmail] = { uid, email: normalizedEmail, password };
-  saveMockAccounts(accounts);
 
+  const uid = "dev_uid_" + Math.random().toString(36).substring(2, 11);
   const user = createMockUserObject({
     uid,
     email: normalizedEmail,
-    emailVerified: true,
+    emailVerified: false,
   });
-  mockAuth.currentUser = user;
+  devAuth.currentUser = user;
   if (typeof window !== "undefined") {
     localStorage.setItem(
       MOCK_STORAGE_KEY,
-      JSON.stringify({ uid, email: normalizedEmail, emailVerified: true })
+      JSON.stringify({ uid, email: normalizedEmail, emailVerified: false })
     );
   }
   notifyListeners();
@@ -218,27 +214,26 @@ export async function signInWithEmailAndPassword(
   if (realAuth) {
     return fbSignInWithEmailAndPassword(authInstance, email, password);
   }
+  if (isProduction) {
+    throw new Error(
+      "Serviço de autenticação temporariamente indisponível. Firebase Authentication não está configurado neste ambiente."
+    );
+  }
+
   const normalizedEmail = email.trim().toLowerCase();
-  const accounts = loadMockAccounts();
-  const existing = accounts[normalizedEmail];
-  if (existing && existing.password !== password) {
+  if (!normalizedEmail.includes("@") || !password) {
     const err: any = new Error("Invalid credential");
     err.code = "auth/invalid-credential";
     throw err;
   }
-  const uid =
-    existing?.uid ||
-    "mock_uid_" + normalizedEmail.replace(/[^a-z0-9]/g, "_");
-  if (!existing) {
-    accounts[normalizedEmail] = { uid, email: normalizedEmail, password };
-    saveMockAccounts(accounts);
-  }
+
+  const uid = "dev_uid_" + normalizedEmail.replace(/[^a-z0-9]/g, "_");
   const user = createMockUserObject({
     uid,
     email: normalizedEmail,
     emailVerified: true,
   });
-  mockAuth.currentUser = user;
+  devAuth.currentUser = user;
   if (typeof window !== "undefined") {
     localStorage.setItem(
       MOCK_STORAGE_KEY,
@@ -253,8 +248,23 @@ export async function sendEmailVerification(user: any): Promise<void> {
   if (realAuth) {
     return fbSendEmailVerification(user);
   }
+  if (isProduction) {
+    throw new Error("Firebase não configurado em produção.");
+  }
   if (user) {
     user.emailVerified = true;
+    if (typeof window !== "undefined") {
+      const stored = localStorage.getItem(MOCK_STORAGE_KEY);
+      if (stored) {
+        try {
+          const parsed = JSON.parse(stored);
+          parsed.emailVerified = true;
+          localStorage.setItem(MOCK_STORAGE_KEY, JSON.stringify(parsed));
+        } catch {
+          // Ignore
+        }
+      }
+    }
   }
 }
 
@@ -264,6 +274,9 @@ export async function sendPasswordResetEmail(
 ): Promise<void> {
   if (realAuth) {
     return fbSendPasswordResetEmail(authInstance, email);
+  }
+  if (isProduction) {
+    throw new Error("Firebase não configurado em produção.");
   }
   if (!email || !email.includes("@")) {
     const err: any = new Error("Invalid email");

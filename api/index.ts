@@ -6,7 +6,7 @@ import { MercadoPagoConfig, Preference, Payment } from "mercadopago";
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { randomInt } from "node:crypto";
+import crypto, { randomInt } from "node:crypto";
 // import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
@@ -22,6 +22,13 @@ const FIREBASE_ENV_KEYS = [
   "FIREBASE_CLIENT_EMAIL",
   "FIREBASE_PRIVATE_KEY"
 ] as const;
+
+function checkIsProduction(): boolean {
+  return (
+    process.env.NODE_ENV === "production" ||
+    Boolean(process.env.VERCEL && process.env.VERCEL_ENV === "production")
+  );
+}
 
 let firestore: Firestore;
 let firebaseAuth: Auth;
@@ -177,24 +184,23 @@ function createMockFirestore(): Firestore {
 function createMockFirebaseAuth(): Auth {
   return {
     async verifyIdToken(idToken: string): Promise<DecodedIdToken> {
+      if (checkIsProduction()) {
+        throw new Error("Tokens simulados são estritamente proibidos em ambiente de produção.");
+      }
       try {
         const decodedStr = Buffer.from(idToken, "base64").toString("utf-8");
         const parsed = JSON.parse(decodedStr);
-        if (parsed && parsed.uid) {
+        if (parsed && typeof parsed.uid === "string" && parsed.uid.trim()) {
           return {
-            uid: parsed.uid,
-            email: parsed.email || "",
+            uid: parsed.uid.trim(),
+            email: typeof parsed.email === "string" ? parsed.email : "",
             email_verified: parsed.email_verified !== false,
           } as DecodedIdToken;
         }
       } catch {
-        // Fallback if token is a raw JWT or string
+        // Token inválido
       }
-      return {
-        uid: "mock_uid_default",
-        email: "peregrino@exuresponde.local",
-        email_verified: true,
-      } as DecodedIdToken;
+      throw new Error("Token de autenticação inválido.");
     },
   } as unknown as Auth;
 }
@@ -207,8 +213,18 @@ function initializeFirebaseAdmin(): void {
   const missingVariables = getMissingFirebaseEnvironmentVariables();
 
   if (missingVariables.length > 0) {
+    if (checkIsProduction()) {
+      const err = new Error(
+        `[SEGURANÇA] Firebase Admin não configurado em ambiente de produção (${missingVariables.join(
+          ", "
+        )}). Fallback mock é estritamente proibido.`
+      );
+      firebaseInitializationError = err;
+      throw err;
+    }
+
     console.warn(
-      `[AI Studio] Firebase Admin env vars missing (${missingVariables.join(", ")}) — using in-memory Firestore & Auth mock.`
+      `[AI Studio DEV] Firebase Admin env vars missing (${missingVariables.join(", ")}) — using in-memory Firestore & Auth mock (apenas ambiente de desenvolvimento/teste).`
     );
     firestore = createMockFirestore();
     firebaseAuth = createMockFirebaseAuth();
@@ -251,41 +267,58 @@ const mp = new MercadoPagoConfig({
   accessToken: process.env.MERCADO_PAGO_ACCESS_TOKEN || ""
 });
 
-
-
-
-
 const app = express();
 const PORT = 3000;
 
 app.use(express.json());
 
 app.get("/api/health", (_req, res) => {
-  try {
-    initializeFirebaseAdmin();
+  const isProd = checkIsProduction();
+  const missingVariables = getMissingFirebaseEnvironmentVariables();
+  const isFbConfigured = missingVariables.length === 0;
+  const isGeminiReady = Boolean(
+    process.env.GEMINI_API_KEY?.trim() || process.env.API_KEY?.trim()
+  );
+  const isMercadoPagoReady = Boolean(
+    process.env.MERCADO_PAGO_ACCESS_TOKEN?.trim() || process.env.MP_ACCESS_TOKEN?.trim()
+  );
 
-    return res.status(200).json({
-      status: "ok",
-      timestamp: new Date().toISOString(),
-      services: {
-        api: "ready",
-        firebaseAdmin: "ready"
-      }
-    });
-  } catch (error) {
-    const initializationError =
-      error instanceof Error ? error : new Error(String(error));
-
-    console.error("[FIREBASE] Falha de configuração:", initializationError.message);
-
+  if (isProd && !isFbConfigured) {
     return res.status(503).json({
       status: "degraded",
       code: "FIREBASE_ADMIN_NOT_CONFIGURED",
-      error:
-        "O servidor de autenticação está temporariamente indisponível. Verifique a configuração do Firebase Admin na Vercel.",
-      missingEnvironmentVariables: getMissingFirebaseEnvironmentVariables()
+      environment: "production",
+      services: {
+        api: "ready",
+        firebaseAdmin: "unconfigured",
+        gemini: isGeminiReady ? "configured" : "unconfigured",
+        mercadoPago: isMercadoPagoReady ? "configured" : "unconfigured",
+      },
+      missingVariables,
     });
   }
+
+  try {
+    initializeFirebaseAdmin();
+  } catch {
+    // tratado acima caso em produção
+  }
+
+  return res.status(200).json({
+    status: isFbConfigured ? "ok" : isProd ? "degraded" : "ok",
+    timestamp: new Date().toISOString(),
+    environment: isProd ? "production" : (process.env.NODE_ENV || "development"),
+    services: {
+      api: "ready",
+      firebaseAdmin: isFbConfigured
+        ? "ready"
+        : isProd
+        ? "unconfigured"
+        : "mock_development_only",
+      gemini: isGeminiReady ? "configured" : "unconfigured",
+      mercadoPago: isMercadoPagoReady ? "configured" : "unconfigured",
+    },
+  });
 });
 
 app.use("/api", (_req, res, next) => {
@@ -355,6 +388,297 @@ async function requireFirebaseAuth(
   }
 }
 
+// ======================================================
+// RATE LIMITING DURÁVEL E CONTROLE DE FLUXO (Vercel Serverless + Hash Anti-Vazamento)
+// ======================================================
+const inMemoryRateLimits = new Map<string, number[]>();
+
+function getClientIp(req: express.Request): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket.remoteAddress || "127.0.0.1";
+}
+
+function checkRateLimit(key: string, maxRequests: number, windowMs: number): boolean {
+  const now = Date.now();
+  let timestamps = inMemoryRateLimits.get(key) || [];
+  timestamps = timestamps.filter((t) => now - t < windowMs);
+
+  if (timestamps.length >= maxRequests) {
+    inMemoryRateLimits.set(key, timestamps);
+    return false;
+  }
+
+  timestamps.push(now);
+  inMemoryRateLimits.set(key, timestamps);
+
+  if (inMemoryRateLimits.size > 3000) {
+    for (const [k, ts] of inMemoryRateLimits.entries()) {
+      if (ts.every((t) => now - t > windowMs)) {
+        inMemoryRateLimits.delete(k);
+      }
+    }
+  }
+
+  return true;
+}
+
+async function checkDurableRateLimit(
+  rawKey: string,
+  maxRequests: number,
+  windowMs: number
+): Promise<boolean> {
+  const now = Date.now();
+
+  // 1. Verificação local em memória (Resposta imediata)
+  let timestamps = inMemoryRateLimits.get(rawKey) || [];
+  timestamps = timestamps.filter((t) => now - t < windowMs);
+
+  if (timestamps.length >= maxRequests) {
+    inMemoryRateLimits.set(rawKey, timestamps);
+    return false;
+  }
+
+  timestamps.push(now);
+  inMemoryRateLimits.set(rawKey, timestamps);
+
+  if (inMemoryRateLimits.size > 3000) {
+    for (const [k, ts] of inMemoryRateLimits.entries()) {
+      if (ts.every((t) => now - t > windowMs)) {
+        inMemoryRateLimits.delete(k);
+      }
+    }
+  }
+
+  // 2. Persistência durável compartilhada no Firestore com hash anônimo (Minimização de IP)
+  try {
+    if (firestore && typeof firestore.collection === "function") {
+      const hashedKey = crypto
+        .createHash("sha256")
+        .update(rawKey)
+        .digest("hex")
+        .slice(0, 32);
+
+      const limitRef = firestore.collection("rate_limits").doc(hashedKey);
+      const doc = await limitRef.get();
+
+      if (doc.exists) {
+        const data = doc.data() || {};
+        const resetAt = Number(data.resetAt || 0);
+        const count = Number(data.count || 0);
+
+        if (resetAt > now) {
+          if (count >= maxRequests) {
+            return false;
+          }
+          await limitRef.update({
+            count: count + 1,
+            updatedAt: now
+          });
+        } else {
+          await limitRef.set({
+            count: 1,
+            resetAt: now + windowMs,
+            updatedAt: now
+          });
+        }
+      } else {
+        await limitRef.set({
+          count: 1,
+          resetAt: now + windowMs,
+          updatedAt: now
+        });
+      }
+    }
+  } catch (_err) {
+    // Resiliente a falhas temporárias do Firestore; controle em memória garante a proteção local
+  }
+
+  return true;
+}
+
+// ======================================================
+// ARQUITETURA TRANSACIONAL DE CRÉDITOS — LIVRO-RAZÃO (LEDGER)
+// ======================================================
+interface CreditLedgerRecord {
+  operationId: string;
+  userId: string;
+  firebaseUid: string;
+  type: "debit" | "refund" | "grant" | "adjustment" | "payment";
+  amount: number;
+  balanceBefore: number;
+  balanceAfter: number;
+  status: "committed" | "refunded" | "failed";
+  source:
+    | "chat"
+    | "tarot"
+    | "numerologia"
+    | "buzios"
+    | "astrologia"
+    | "admin"
+    | "registration"
+    | "payment"
+    | "mercadopago";
+  consultationId?: string;
+  paymentId?: string;
+  orderId?: string;
+  planId?: string;
+  reason?: string;
+  adminId?: string;
+  createdAt: string;
+  committedAt?: string;
+  reversedAt?: string;
+  idempotencyKey?: string;
+}
+
+async function executeCreditDebitTransactional(params: {
+  userRef: any;
+  cost: number;
+  xpAwarded: number;
+  source: CreditLedgerRecord["source"];
+  consultationId?: string;
+  idempotencyKey?: string;
+}): Promise<{
+  balanceBefore: number;
+  balanceAfter: number;
+  operationId: string;
+  newXp: number;
+  newLevel: string;
+}> {
+  const operationId =
+    "op_" + Date.now() + "_" + Math.random().toString(36).substring(2, 9);
+  const now = new Date().toISOString();
+
+  return firestore.runTransaction(async (transaction: any) => {
+    const userDoc = await transaction.get(params.userRef);
+    if (!userDoc.exists) {
+      const err: any = new Error("Buscador não encontrado na base sagrada.");
+      err.status = 404;
+      throw err;
+    }
+    const userData = userDoc.data() || {};
+
+    if (userData.isBlocked) {
+      const err: any = new Error("Conta bloqueada para operações espirituais.");
+      err.status = 403;
+      throw err;
+    }
+
+    const currentCredits = Number(userData.credits || 0);
+
+    if (currentCredits < params.cost) {
+      const err: any = new Error(
+        `Saldo insuficiente de Axé. Necessário: ${params.cost}, disponível: ${currentCredits}`
+      );
+      err.code = "INSUFFICIENT_CREDITS";
+      err.status = 402;
+      err.available = currentCredits;
+      throw err;
+    }
+
+    const balanceAfter = currentCredits - params.cost;
+    const newXp = Number(userData.xp || 0) + params.xpAwarded;
+    const { level: newLevel } = checkXpLevel(newXp);
+
+    transaction.update(params.userRef, {
+      credits: balanceAfter,
+      xp: newXp,
+      level: newLevel,
+      updatedAt: now,
+    });
+
+    const ledgerRef = firestore
+      .collection("credit_ledger")
+      .doc(params.idempotencyKey || operationId);
+
+    transaction.set(ledgerRef, {
+      operationId,
+      userId: userDoc.id,
+      firebaseUid: userData.firebaseUid || "",
+      type: "debit",
+      amount: params.cost,
+      balanceBefore: currentCredits,
+      balanceAfter,
+      status: "committed",
+      source: params.source,
+      consultationId: params.consultationId || "",
+      createdAt: now,
+      idempotencyKey: params.idempotencyKey || operationId,
+    });
+
+    return {
+      balanceBefore: currentCredits,
+      balanceAfter,
+      operationId,
+      newXp,
+      newLevel,
+    };
+  });
+}
+
+async function executeCreditRefundTransactional(params: {
+  userRef: any;
+  amount: number;
+  originalOperationId: string;
+  source: CreditLedgerRecord["source"];
+  reason: string;
+}): Promise<{ balanceAfter: number; operationId: string }> {
+  const operationId =
+    "ref_" + Date.now() + "_" + Math.random().toString(36).substring(2, 9);
+  const now = new Date().toISOString();
+
+  return firestore.runTransaction(async (transaction: any) => {
+    const userDoc = await transaction.get(params.userRef);
+    if (!userDoc.exists) {
+      throw new Error("Usuário não encontrado para estorno.");
+    }
+    const userData = userDoc.data() || {};
+    const currentCredits = Number(userData.credits || 0);
+    const balanceAfter = currentCredits + params.amount;
+
+    transaction.update(params.userRef, {
+      credits: balanceAfter,
+      updatedAt: now,
+    });
+
+    const ledgerRef = firestore.collection("credit_ledger").doc(operationId);
+    transaction.set(ledgerRef, {
+      operationId,
+      originalOperationId: params.originalOperationId,
+      userId: userDoc.id,
+      firebaseUid: userData.firebaseUid || "",
+      type: "refund",
+      amount: params.amount,
+      balanceBefore: currentCredits,
+      balanceAfter,
+      status: "refunded",
+      source: params.source,
+      reason: params.reason,
+      createdAt: now,
+    });
+
+    return { balanceAfter, operationId };
+  });
+}
+
+async function requireEmailVerified(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const firebaseUser = (req as any).firebaseUser as DecodedIdToken | undefined;
+  if (!firebaseUser?.email_verified) {
+    return res.status(403).json({
+      code: "EMAIL_NOT_VERIFIED",
+      error:
+        "Confirmação de e-mail obrigatória para utilizar oráculos e consultas.",
+    });
+  }
+  return next();
+}
+
 async function requirePortalUser(
   req: express.Request,
   res: express.Response,
@@ -362,32 +686,57 @@ async function requirePortalUser(
 ) {
   const firebaseUser =
     (req as any).firebaseUser as DecodedIdToken | undefined;
-  const userId = String(req.headers["x-user-id"] || "").trim();
+  const headerUserId = String(req.headers["x-user-id"] || "").trim();
 
-  if (!firebaseUser?.uid || !userId) {
+  if (!firebaseUser?.uid) {
     return res.status(401).json({
       error: "Sessão do usuário não identificada."
     });
   }
 
   try {
-    const userDoc = await firestore.collection("users").doc(userId).get();
+    let userDoc: any = null;
 
-    if (!userDoc.exists) {
+    // 1. Autoridade Primária: Busca estrita por firebaseUid
+    const uidSnapshot = await firestore
+      .collection("users")
+      .where("firebaseUid", "==", firebaseUser.uid)
+      .limit(1)
+      .get();
+
+    if (!uidSnapshot.empty) {
+      userDoc = uidSnapshot.docs[0];
+    } else if (headerUserId) {
+      // 2. Fallback de compatibilidade por ID caso o vínculo ainda não tenha sido gravado
+      const directDoc = await firestore.collection("users").doc(headerUserId).get();
+      if (directDoc.exists) {
+        userDoc = directDoc;
+      }
+    } else if (firebaseUser.email) {
+      // 3. Fallback de migração de contas legadas por e-mail verificado
+      const emailSnapshot = await firestore
+        .collection("users")
+        .where("email", "==", firebaseUser.email.trim().toLowerCase())
+        .limit(1)
+        .get();
+      if (!emailSnapshot.empty) {
+        userDoc = emailSnapshot.docs[0];
+      }
+    }
+
+    if (!userDoc || !userDoc.exists) {
       return res.status(404).json({
-        error: "Usuário não encontrado."
+        error: "Buscador não encontrado no portal."
       });
     }
 
     const userData = userDoc.data() as any;
-    const firebaseEmail =
-      typeof firebaseUser.email === "string"
-        ? firebaseUser.email.trim().toLowerCase()
-        : "";
-    const storedEmail =
-      typeof userData?.email === "string"
-        ? userData.email.trim().toLowerCase()
-        : "";
+
+    if (userData.isBlocked) {
+      return res.status(403).json({
+        error: "Esta conta está suspensa das práticas do terreiro."
+      });
+    }
 
     if (
       userData?.firebaseUid &&
@@ -399,12 +748,6 @@ async function requirePortalUser(
     }
 
     if (!userData?.firebaseUid) {
-      if (!firebaseEmail || !storedEmail || firebaseEmail !== storedEmail) {
-        return res.status(403).json({
-          error: "Não foi possível validar o vínculo desta conta."
-        });
-      }
-
       await userDoc.ref.set(
         {
           firebaseUid: firebaseUser.uid,
@@ -413,12 +756,12 @@ async function requirePortalUser(
         },
         { merge: true }
       );
-
       userData.firebaseUid = firebaseUser.uid;
     }
 
     (req as any).portalUser = {
       id: userDoc.id,
+      ref: userDoc.ref,
       ...userData
     };
 
@@ -1870,7 +2213,7 @@ async function loadUserMessages(userId: string): Promise<PersistedMessage[]> {
   const snapshot = await firestore
     .collection("messages")
     .where("userId", "==", userId)
-    .limit(500)
+    .limit(200)
     .get();
 
   return snapshot.docs
@@ -1883,6 +2226,32 @@ async function loadUserMessages(userId: string): Promise<PersistedMessage[]> {
         new Date(a.timestamp || 0).getTime() -
         new Date(b.timestamp || 0).getTime()
     );
+}
+
+async function loadRecentUserMessages(userId: string, limitCount = 8): Promise<PersistedMessage[]> {
+  try {
+    const snapshot = await firestore
+      .collection("messages")
+      .where("userId", "==", userId)
+      .limit(limitCount * 2)
+      .get();
+
+    const messages = snapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data()
+    } as PersistedMessage));
+
+    messages.sort(
+      (a, b) =>
+        new Date(a.timestamp || 0).getTime() -
+        new Date(b.timestamp || 0).getTime()
+    );
+
+    return messages.slice(-limitCount);
+  } catch (err) {
+    console.error("[FIRESTORE] Falha ao carregar mensagens recentes:", err);
+    return [];
+  }
 }
 
 async function loadKnowledgeItems(): Promise<any[]> {
@@ -2403,7 +2772,6 @@ app.post(
       deviceId,
       browser,
       session,
-      captchaAnswer,
       honeypot
     } = req.body;
 
@@ -2432,10 +2800,13 @@ app.post(
       });
     }
 
-    if (!captchaAnswer || parseInt(captchaAnswer) !== 7) {
-      return res.status(400).json({
+    // Identificação de IP e Rate Limiting Durável
+    const clientIp = getClientIp(req);
+
+    if (!await checkDurableRateLimit(`reg_${clientIp}`, 5, 15 * 60 * 1000)) {
+      return res.status(429).json({
         error:
-          "Resposta do desafio anti-bot incorreta. Quanto é 4 + 3?"
+          "Muitas tentativas de cadastro a partir deste endereço. Por favor, aguarde 15 minutos."
       });
     }
 
@@ -2456,156 +2827,161 @@ app.post(
       });
     }
 
-const db = loadDb();
+    const normalizedEmail = email.toLowerCase();
+    const normalizedDeviceId = deviceId || "dev_not_tracked";
 
-// Identify IP
-const clientIp = (req.headers["x-forwarded-for"] as string || req.socket.remoteAddress || "127.0.0.1")
-  .split(",")[0]
-  .trim();
+    // Verifica e-mail no Firestore
+    const emailSnapshot = await firestore
+      .collection("users")
+      .where("email", "==", normalizedEmail)
+      .limit(1)
+      .get();
 
-const normalizedEmail = email.toLowerCase();
-const normalizedDeviceId = deviceId || "dev_not_tracked";
+    if (!emailSnapshot.empty) {
+      return res.status(400).json({ error: "Este email já está cadastrado em nosso portal." });
+    }
 
-// Verifica e-mail no Firestore
-const emailSnapshot = await firestore
-  .collection("users")
-  .where("email", "==", normalizedEmail)
-  .limit(1)
-  .get();
+    // Verifica dispositivo no Firestore
+    let hasDeviceMatch = false;
+    if (normalizedDeviceId !== "dev_not_tracked") {
+      const deviceSnapshot = await firestore
+        .collection("users")
+        .where("deviceId", "==", normalizedDeviceId)
+        .limit(1)
+        .get();
 
-if (!emailSnapshot.empty) {
-  return res.status(400).json({ error: "Este email já está cadastrado em nosso portal." });
-}
+      hasDeviceMatch = !deviceSnapshot.empty;
+    }
 
-// Verifica dispositivo no Firestore
-let hasDeviceMatch = false;
+    // Verifica IP no Firestore (sem limit(1) para contar contas recentes com precisão)
+    const ipSnapshot = await firestore
+      .collection("users")
+      .where("ip", "==", clientIp)
+      .get();
 
-if (normalizedDeviceId !== "dev_not_tracked") {
-  const deviceSnapshot = await firestore
-    .collection("users")
-    .where("deviceId", "==", normalizedDeviceId)
-    .limit(1)
-    .get();
+    const hasIpMatch = !ipSnapshot.empty;
+    const ipUsers = ipSnapshot.docs.map(doc => doc.data());
 
-  hasDeviceMatch = !deviceSnapshot.empty;
-}
+    const hasSameIpBrowser = ipUsers.some((u: any) =>
+      u.browser === (browser || "unknown")
+    );
 
-// Verifica IP no Firestore
-const ipSnapshot = await firestore
-  .collection("users")
-  .where("ip", "==", clientIp)
-  .limit(1)
-  .get();
+    const hasSameIpSession = ipUsers.some((u: any) =>
+      u.sessionSign === (session || "unknown")
+    );
 
-const hasIpMatch = !ipSnapshot.empty;
-
-const ipUsers = ipSnapshot.docs.map(doc => doc.data());
-
-const hasSameIpBrowser = ipUsers.some((u: any) =>
-  u.browser === (browser || "unknown")
-);
-
-const hasSameIpSession = ipUsers.some((u: any) =>
-  u.sessionSign === (session || "unknown")
-);
-
-const recentIpAccounts = ipUsers.filter((u: any) => {
-  const created = new Date(u.createdAt || 0).getTime();
-  return created && Date.now() - created < 24 * 60 * 60 * 1000;
-});
-
-const tooManyRecentIpAccounts = recentIpAccounts.length >= 2;
-
-const fraudReasons: string[] = [];
-
-if (!deviceId || normalizedDeviceId === "dev_not_tracked") {
-  fraudReasons.push("missing_device_id");
-}
-
-if (hasIpMatch) fraudReasons.push("ip_already_used");
-if (hasDeviceMatch) fraudReasons.push("device_already_used");
-if (hasSameIpBrowser) fraudReasons.push("same_ip_and_browser");
-if (hasSameIpSession) fraudReasons.push("same_ip_and_session");
-if (tooManyRecentIpAccounts) fraudReasons.push("too_many_recent_accounts_same_ip");
-
-const creditsBlocked = fraudReasons.length > 0;
-const initialCredits = creditsBlocked ? 0 : 5;
-
-    // Generate spiritual details
-  const spiritualProps = calculateSpiritualProfile(birthName, birthDate, birthTime, placeToUseSubmit);
-  const cleanFirstName = birthName.split(" ")[0];
-
-  
-
-
-  const newUser = {
-    id: "usr_" + Math.random().toString(36).substring(2, 11),
-    firebaseUid: firebaseUser.uid,
-    email: normalizedEmail,
-    name:
-      cleanFirstName.charAt(0).toUpperCase() +
-      cleanFirstName.slice(1).toLowerCase(),
-    birthName,
-    birthDate,
-    birthTime: birthTime || "",
-    birthPlace: placeToUseSubmit,
-    role: "user",
-    level: "Buscador",
-    xp: 0,
-    credits: initialCredits,
-    promotionalCreditsBlocked: creditsBlocked,
-    avatarSeed:
-      "eleg_seed_" + Math.floor(Math.random() * 9999),
-    createdAt: new Date().toISOString(),
-    ip: clientIp,
-    deviceId: deviceId || "dev_not_tracked",
-    browser: browser || "unknown",
-    sessionSign: session || "unknown",
-    emailVerified: Boolean(firebaseUser.email_verified),
-    ...spiritualProps
-  };
-
-  db.users.push(newUser);
-
-  await firestore
-    .collection("users")
-    .doc(newUser.id)
-    .set({
-      ...newUser,
-      createdAt: new Date().toISOString(),
-      fraudReasons
+    const recentIpAccounts = ipUsers.filter((u: any) => {
+      const created = new Date(u.createdAt || 0).getTime();
+      return created && Date.now() - created < 24 * 60 * 60 * 1000;
     });
 
+    const tooManyRecentIpAccounts = recentIpAccounts.length >= 2;
 
+    const fraudReasons: string[] = [];
 
+    if (!deviceId || normalizedDeviceId === "dev_not_tracked") {
+      fraudReasons.push("missing_device_id");
+    }
 
+    if (hasIpMatch) fraudReasons.push("ip_already_used");
+    if (hasDeviceMatch) fraudReasons.push("device_already_used");
+    if (hasSameIpBrowser) fraudReasons.push("same_ip_and_browser");
+    if (hasSameIpSession) fraudReasons.push("same_ip_and_session");
+    if (tooManyRecentIpAccounts) fraudReasons.push("too_many_recent_accounts_same_ip");
 
-await firestore.collection("security_logs").add({
-  type: "register_attempt",
-  userId: newUser.id,
-  email: normalizedEmail,
-  ip: clientIp,
-  deviceId: normalizedDeviceId,
-  browser: browser || "unknown",
-  sessionSign: session || "unknown",
-  creditsGranted: initialCredits,
-  promotionalCreditsBlocked: creditsBlocked,
-  fraudReasons,
-  createdAt: new Date().toISOString()
-});
+    const creditsBlocked = fraudReasons.length > 0;
+    const isEmailVerified = Boolean(firebaseUser.email_verified);
 
-  // Generate automated Initial Reading Completa before first conversation
-  let readingReport = "";
-  try {
-    const ai = getGeminiClient();
-    const prompt = `Como o oráculo de luz místico EXU RESPONDE, gere uma Leitura Inicial Completa para o consultante ${newUser.name}. 
+    // REGRA DE SEGURANÇA: ZERO créditos utilizáveis e ZERO chamadas de IA antes do e-mail verificado!
+    const initialCredits = isEmailVerified && !creditsBlocked ? 5 : 0;
+
+    // Generate spiritual details
+    const spiritualProps = calculateSpiritualProfile(birthName, birthDate, birthTime, placeToUseSubmit);
+    const cleanFirstName = birthName.split(" ")[0];
+
+    const newUser = {
+      id: "usr_" + Math.random().toString(36).substring(2, 11),
+      firebaseUid: firebaseUser.uid,
+      email: normalizedEmail,
+      name:
+        cleanFirstName.charAt(0).toUpperCase() +
+        cleanFirstName.slice(1).toLowerCase(),
+      birthName,
+      birthDate,
+      birthTime: birthTime || "",
+      birthPlace: placeToUseSubmit,
+      role: "user",
+      level: "Buscador",
+      xp: 0,
+      credits: initialCredits,
+      promotionalCreditsBlocked: creditsBlocked,
+      avatarSeed:
+        "eleg_seed_" + Math.floor(Math.random() * 9999),
+      createdAt: new Date().toISOString(),
+      ip: clientIp,
+      deviceId: deviceId || "dev_not_tracked",
+      browser: browser || "unknown",
+      sessionSign: session || "unknown",
+      emailVerified: isEmailVerified,
+      ...spiritualProps
+    };
+
+    await firestore
+      .collection("users")
+      .doc(newUser.id)
+      .set({
+        ...newUser,
+        createdAt: new Date().toISOString(),
+        fraudReasons
+      });
+
+    // Se créditos promocionais foram concedidos imediatamente (ex: e-mail já veio verificado), registrar no Ledger
+    if (initialCredits > 0) {
+      await firestore
+        .collection("credit_ledger")
+        .doc("op_reg_" + newUser.id)
+        .set({
+          operationId: "op_reg_" + newUser.id,
+          userId: newUser.id,
+          firebaseUid: firebaseUser.uid,
+          type: "grant",
+          amount: initialCredits,
+          balanceBefore: 0,
+          balanceAfter: initialCredits,
+          status: "committed",
+          source: "registration",
+          reason: "Boas-vindas ao terreiro (crédito promocional de abertura)",
+          createdAt: new Date().toISOString()
+        });
+    }
+
+    await firestore.collection("security_logs").add({
+      type: "register_attempt",
+      userId: newUser.id,
+      email: normalizedEmail,
+      ip: clientIp,
+      deviceId: normalizedDeviceId,
+      browser: browser || "unknown",
+      sessionSign: session || "unknown",
+      creditsGranted: initialCredits,
+      promotionalCreditsBlocked: creditsBlocked,
+      emailVerified: isEmailVerified,
+      fraudReasons,
+      createdAt: new Date().toISOString()
+    });
+
+    // REGRA DE SEGURANÇA: NÃO chamar Gemini se o e-mail não estiver verificado!
+    // Para contas não verificadas, gera leitura determinística dos fundamentos sem custo de IA.
+    let readingReport = "";
+    if (isEmailVerified) {
+      try {
+        const prompt = `Como o oráculo de luz místico EXU RESPONDE, gere uma Leitura Inicial Completa para o consultante ${newUser.name}. 
 O tom deve ser solene, prestigioso, estratégico, sutil e carregado com português tradicional de terreiro.
 
 Dados sagrados do peregrino:
 - Nome Completo de Solteiro: ${newUser.birthName}
 - Data de Nascimento: ${newUser.birthDate}
 - Horário de Nascimento: ${newUser.birthTime || "Não informado"}
-
 
 Você DEVE estruturar o relatório obrigatoriamente utilizando Markdown com as seguintes seções bem delimitadas:
 
@@ -2616,129 +2992,67 @@ Você DEVE estruturar o relatório obrigatoriamente utilizando Markdown com as s
 - Exu de afinidade (calculado: ${newUser.exuAfinidade})
 - Arquétipo predominante (calculado: ${newUser.arquetipoDominante})
 - Assinatura energética: ${newUser.assinaturaEnergetica}
-- Caminhos favoráveis
-- Pontos de atenção
 
 ### PERFIL NUMEROLÓGICO
 - Número de destino: ${newUser.destinyNumber}
 - Número da alma: ${newUser.soulNumber}
 - Número de expressão: ${newUser.expressionNumber}
-- Número pessoal: ${((newUser.destinyNumber + newUser.soulNumber) % 9) || 9}
-- Ciclos de vida
 - Ano pessoal (calendário 2026): ${newUser.personalYear}
 
 ### PERFIL ASTROLÓGICO
 - Signo solar: ${newUser.sunSign || "Áries"}
-- Ascendente (quando possível de acordo com o horário de nascimento: ${newUser.birthTime || 'Indisponível'})
-- Mapa astral sintetizado das forças
 - Influências planetárias dominantes
-- Horário planetário favorável
-
-### ORÁCULOS
-- Interpretação dos búzios (6 búzios abertos: Obará, etc.)
-- Odu relacionado espiritualidade de búzios
-- Carta simbólica do dia do Tarot (Exemplo: O Mago)
-- Tendências energéticas para o seu autoconhecimento astral
 
 ### RESUMO DOS DESTINOS
-- Quem é a pessoa
-- Potenciais natos
-- Dificuldades da caminhada
-- Vocação espiritual / profissional
-- Caminho de vida geral
-- Tendências de vida gerais
-- Conselhos reflexivos e pragmáticos de Exu
+- Quem é a pessoa e seus caminhos
+- Conselhos reflexivos e pragmáticos de Exu`;
 
-Importante: Termine obrigatoriamente com a seguinte declaração em caixa ou caixa de aviso: "Todas as interpretações deste portal são puramente, culturais, literárias, de autoconhecimento educacional e espiritualidade. Jamais constituem promessas garantidas, verdades fáticas irrefutáveis ou aconselhamentos profissionais (médico/jurídico)."`;
+        const geminiResult = await generateWithGeminiFallback({
+          contents: prompt,
+          systemInstruction:
+            "Você é Exu falando no Exu Responde. Responda com dignidade tradicional de terreiro e sabedoria prática.",
+        });
 
-   
+        readingReport = fixPortugueseEncoding(geminiResult.text);
+      } catch (err) {
+        console.error("Gemini no cadastro falhou, usando leitura determinística:", err);
+      }
+    }
 
+    if (!readingReport) {
+      readingReport = generateDeterministicInitialReading(newUser);
+    }
 
+    // Salva Leitura Inicial no Firestore
+    const initialReadingId = "msg_init_read_" + Date.now();
+    const initialReadingMessage: PersistedMessage = {
+      id: initialReadingId,
+      userId: newUser.id,
+      sender: "exu",
+      text: readingReport,
+      timestamp: new Date().toISOString()
+    };
 
+    const firstConversationStarterId = "msg_opener_" + (Date.now() + 1);
+    const firstConversationMessage: PersistedMessage = {
+      id: firstConversationStarterId,
+      userId: newUser.id,
+      sender: "exu",
+      text: isEmailVerified
+        ? "Salve sua banda, filho de fé. Já observei os caminhos apresentados pelos dados que me confiou. Em que posso ajudar?"
+        : "Salve sua banda, filho de fé. Seu cadastro foi recebido. Confirme seu e-mail para despertar seu saldo de Axé e consultar os oráculos.",
+      timestamp: new Date().toISOString()
+    };
 
+    await persistMessages([initialReadingMessage, firstConversationMessage]);
 
-
-let aiInterpretation = "";
-
-try {
-  const geminiResult = await generateWithGeminiFallback({
-    contents: prompt,
-    systemInstruction:
-      "Você é Exu falando pelo Tarot dos Caminhos. Use obrigatoriamente as cartas sorteadas e suas traduções oficiais. Responda como leitura espiritual, não como aula.",
-  });
-
-  aiInterpretation = geminiResult.text;
-
-  console.log(
-    `[TAROT INICIAL] Resposta gerada pelo modelo ${geminiResult.model}.`
-  );
-} catch (geminiError) {
-  console.error(
-    "[TAROT INICIAL] Todos os modelos Gemini falharam:",
-    geminiError
-  );
-
-  aiInterpretation =
-    TEMPLE_FALLBACKS[
-      Math.floor(Math.random() * TEMPLE_FALLBACKS.length)
-    ];
-}
-
-readingReport = fixPortugueseEncoding(aiInterpretation);
-
-
-
-
-
-
-
-
-
-
-
-  } catch (err) {
-    console.error("Gemini failed, creating deterministic standard reading report:", err);
+    return res.json({
+      success: true,
+      user: newUser,
+      requiresEmailVerification: !isEmailVerified
+    });
   }
-
-  if (!readingReport) {
-    readingReport = generateDeterministicInitialReading(newUser);
-  }
-
-  // Save Leitura Inicial report in message history of the user
-  const initialReadingId = "msg_init_read_" + Date.now();
-  const initialReadingMessage: PersistedMessage = {
-    id: initialReadingId,
-    userId: newUser.id,
-    sender: "exu",
-    text: readingReport,
-    timestamp: new Date().toISOString()
-  };
-
-  // Save Opening Conversation text requested in ABERTURA DA CONVERSA rules
-  const firstConversationStarterId = "msg_opener_" + (Date.now() + 1);
-  const firstConversationMessage: PersistedMessage = {
-    id: firstConversationStarterId,
-    userId: newUser.id,
-    sender: "exu",
-    text: "Salve sua banda, filho de fé. Já observei os caminhos apresentados pelos dados que me confiou. Em que posso ajudar?",
-    timestamp: new Date().toISOString()
-  };
-
-  db.messages.push(initialReadingMessage, firstConversationMessage);
-  await persistMessages([initialReadingMessage, firstConversationMessage]);
-
-  db.logs.push({
-    id: "log_" + Date.now(),
-    userId: newUser.id,
-    action: "Cadastro Completo e Leitura Inicial",
-    details: `Portal cruzado. Fingerprint cadastrado. Ip: ${clientIp}. Créditos promocionais: ${newUser.credits} (Bloqueado por Abuso: ${creditsBlocked ? 'Sim' : 'Não'}).`,
-    timestamp: new Date().toISOString()
-  });
-
-  await persistLatestActivityLog(db);
-  saveDb(db);
-  res.json({ success: true, user: newUser });
-});
+);
 
 
 
@@ -2759,6 +3073,14 @@ app.post(
     if (!firebaseUser?.uid || !firebaseEmail) {
       return res.status(401).json({
         error: "A identidade Firebase não pôde ser validada."
+      });
+    }
+
+    const clientIp = getClientIp(req);
+
+    if (!await checkDurableRateLimit(`login_${clientIp}`, 15, 15 * 60 * 1000)) {
+      return res.status(429).json({
+        error: "Muitas tentativas de login recentes. Por favor, aguarde alguns minutos."
       });
     }
 
@@ -2784,11 +3106,20 @@ app.post(
       });
     }
 
-    const snapshot = await firestore
+    // Busca usuário primariamente por firebaseUid, depois por email
+    let snapshot = await firestore
       .collection("users")
-      .where("email", "==", firebaseEmail)
+      .where("firebaseUid", "==", firebaseUser.uid)
       .limit(1)
       .get();
+
+    if (snapshot.empty) {
+      snapshot = await firestore
+        .collection("users")
+        .where("email", "==", firebaseEmail)
+        .limit(1)
+        .get();
+    }
 
     if (snapshot.empty) {
       return res.status(404).json({
@@ -2800,24 +3131,56 @@ app.post(
     const doc = snapshot.docs[0];
     const userData = doc.data() as any;
 
-    // Conta antiga ainda sem vínculo Firebase:
-    // vincula com segurança usando o token autenticado.
-    if (!userData.firebaseUid) {
-      await doc.ref.set(
-        {
-          firebaseUid: firebaseUser.uid,
-          emailVerified: true,
-          updatedAt: new Date().toISOString()
-        },
-        { merge: true }
-      );
+    if (userData.isBlocked) {
+      return res.status(403).json({
+        error: "Este perfil foi suspenso por medidas de segurança do terreiro."
+      });
+    }
 
-    } else if (userData.firebaseUid !== firebaseUser.uid) {
+    if (userData.firebaseUid && userData.firebaseUid !== firebaseUser.uid) {
       return res.status(403).json({
         error:
           "Esta conta está vinculada a outra identidade Firebase."
       });
     }
+
+    // Ativação de créditos promocionais se foi recém-verificado
+    let creditsToUpdate = Number(userData.credits || 0);
+    const wasUnverified = !userData.emailVerified;
+
+    if (
+      wasUnverified &&
+      !userData.promotionalCreditsBlocked &&
+      creditsToUpdate === 0
+    ) {
+      creditsToUpdate = 5;
+      await firestore
+        .collection("credit_ledger")
+        .doc("op_grant_verify_" + doc.id)
+        .set({
+          operationId: "op_grant_verify_" + doc.id,
+          userId: doc.id,
+          firebaseUid: firebaseUser.uid,
+          type: "grant",
+          amount: 5,
+          balanceBefore: 0,
+          balanceAfter: 5,
+          status: "committed",
+          source: "registration",
+          reason: "Créditos promocionais concedidos após confirmação do e-mail",
+          createdAt: new Date().toISOString()
+        });
+    }
+
+    await doc.ref.set(
+      {
+        firebaseUid: firebaseUser.uid,
+        emailVerified: true,
+        credits: creditsToUpdate,
+        updatedAt: new Date().toISOString()
+      },
+      { merge: true }
+    );
 
     const refreshedDoc = await doc.ref.get();
 
@@ -2834,6 +3197,38 @@ app.post(
 
 
 
+
+// Auth API - Password Reset / Forgot Password
+app.post(
+  ["/api/auth/reset-password", "/api/auth/forgot-password"],
+  async (req, res) => {
+    const clientIp = getClientIp(req);
+
+    if (!await checkDurableRateLimit(`pwd_reset_${clientIp}`, 5, 15 * 60 * 1000)) {
+      return res.status(429).json({
+        error: "Muitas tentativas de recuperação de senha. Por favor, aguarde 15 minutos."
+      });
+    }
+
+    const { email } = req.body;
+    if (!email || typeof email !== "string" || !email.includes("@")) {
+      return res.status(400).json({ error: "Informe um endereço de e-mail válido." });
+    }
+
+    try {
+      if (firebaseAuth && typeof (firebaseAuth as any).generatePasswordResetLink === "function") {
+        await (firebaseAuth as any).generatePasswordResetLink(email.trim().toLowerCase());
+      }
+    } catch (_e) {
+      // Silencia detalhes do erro para evitar enumeração de contas
+    }
+
+    return res.json({
+      success: true,
+      message: "Se o e-mail estiver cadastrado em nosso portal, o link de recuperação foi enviado."
+    });
+  }
+);
 
 // Load Current Profile
 app.get(
@@ -3054,19 +3449,13 @@ app.post(
       { merge: true }
     );
 
-    const db = loadDb();
-
-    db.logs.push({
-      id: "log_" + Date.now(),
+    await firestore.collection("activity_logs").add({
       userId: userDoc.id,
       action: "Atualização de Identidade",
       details:
         "Recálculo do perfil astrológico e numerológico ancestral concluído com sucesso.",
       timestamp: new Date().toISOString()
     });
-
-    await persistLatestActivityLog(db);
-    saveDb(db);
 
     return res.json({
       success: true,
@@ -3436,58 +3825,40 @@ app.post(
   "/api/oraculo/tarot",
   requireFirebaseAuth,
   requirePortalUser,
+  requireEmailVerified,
   async (req, res) => {
-  const userId = req.headers["x-user-id"] as string;
-  const { question, slotsCount } = req.body; // slotsCount: 1 or 3
+    const portalUser = (req as any).portalUser;
+    const { question, slotsCount } = req.body; // slotsCount: 1 or 3
 
-  if (!userId) return res.status(411).json({ error: "Não autorizado." });
+    if (!await checkDurableRateLimit(`tarot_${portalUser.id}`, 15, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas tiragens em sequência. Aguarde um instante." });
+    }
 
-  const userDocRef = firestore.collection("users").doc(userId);
-const userDoc = await userDocRef.get();
+    const cost = slotsCount === 3 ? 3 : 2;
+    const xpAwarded = slotsCount === 3 ? 45 : 30;
 
-if (!userDoc.exists) {
-  return res.status(404).json({ error: "Usuário não encontrado." });
-}
+    let debitResult: any;
+    try {
+      debitResult = await executeCreditDebitTransactional({
+        userRef: portalUser.ref,
+        cost,
+        xpAwarded,
+        source: "tarot",
+        consultationId: "tarot_" + Date.now(),
+      });
+    } catch (debitErr: any) {
+      return res.status(debitErr.status || 400).json({
+        error: debitErr.message || "Créditos insuficientes para acessar este oráculo superior."
+      });
+    }
 
-const user = {
-  id: userDoc.id,
-  ...userDoc.data()
-} as any;
+    const drawn = drawTarotCards(slotsCount === 3 ? 3 : 1);
+    const tarotContext = formatTarotCards(drawn);
 
-const cost = slotsCount === 3 ? 3 : 2;
-
-if (user.credits < cost) {
-  return res.status(400).json({ error: "Créditos insuficientes para acessar este oráculo superior." });
-}
-
-const newCredits = user.credits - cost;
-const newXp = (user.xp || 0) + (slotsCount === 3 ? 45 : 30);
-const { level } = checkXpLevel(newXp);
-
-await userDocRef.update({
-  credits: newCredits,
-  xp: newXp,
-  level
-  }
-);
-
-user.credits = newCredits;
-user.xp = newXp;
-user.level = level;
-
-const db = loadDb();
-
-const drawn = drawTarotCards(slotsCount === 3 ? 3 : 1);
-const tarotContext = formatTarotCards(drawn);
-
-  // Perform Gemini AI structured oracle reading
-  let aiInterpretation = "";
-  try {
-
-    const ai = getGeminiClient();
-
-
-const prompt = `
+    // Perform Gemini AI structured oracle reading
+    let aiInterpretation = "";
+    try {
+      const prompt = `
 Você é Exu falando dentro do Tarot dos Caminhos.
 
 Não responda como assistente.
@@ -3497,7 +3868,7 @@ Não explique Tarot como aula.
 Faça uma leitura espiritual, direta, viva e comunicativa.
 
 CONSULENTE:
-${user.name || "Consulente"}
+${portalUser.name || "Consulente"}
 
 PERGUNTA OU FOCO:
 "${question || "Direcionamento geral para a jornada"}"
@@ -3522,166 +3893,108 @@ ESTILO:
 Firme, espiritual, humano, direto, bonito e fácil de entender.
 
 FORMATO:
-
 1. Abra dizendo quais cartas saíram.
-
 2. Não interprete as cartas separadamente.
-
 3. Leia a combinação entre elas.
-
 4. Explique o que a união das cartas revela.
-
 5. Mostre:
 - o sinal principal
 - o conflito principal
 - a tendência principal
-
 6. Fale como Exu lendo uma história e não como professor explicando Tarot.
-
 7. O consulente deve sentir que recebeu uma consulta e não uma descrição de cartas.
-
-8. Use as traduções das cartas como base, mas produza uma leitura única e integrada.
-
-9. Feche com um conselho direto de Exu.
-
+8. Feche com um conselho direto de Exu.
 `;
 
+      const geminiResult = await generateWithGeminiFallback({
+        contents: prompt,
+        systemInstruction:
+          "Você é Exu falando pelo Tarot dos Caminhos. Use obrigatoriamente as cartas sorteadas e suas traduções oficiais. Responda como leitura espiritual, não como aula.",
+      });
 
+      aiInterpretation = fixPortugueseEncoding(geminiResult.text);
+    } catch (error) {
+      console.error("[TAROT] Falha na consulta Gemini:", error);
+      try {
+        await executeCreditRefundTransactional({
+          userRef: portalUser.ref,
+          amount: cost,
+          originalOperationId: debitResult.operationId,
+          source: "tarot",
+          reason: "Falha de processamento de oráculo",
+        });
+        return res.status(503).json({
+          error: "Os caminhos do oráculo oscilaram. Seus créditos de Axé foram integralmente preservados e estornados.",
+          creditsLeft: debitResult.balanceBefore,
+        });
+      } catch (refundErr) {
+        console.error("[TAROT] Erro ao estornar créditos:", refundErr);
+        aiInterpretation = TEMPLE_FALLBACKS[Math.floor(Math.random() * TEMPLE_FALLBACKS.length)];
+      }
+    }
 
+    await firestore.collection("activity_logs").add({
+      userId: portalUser.id,
+      action: "Oráculo - Tarot",
+      details: `Sorteio de ${slotsCount} carta(s). Cartas: ${drawn.map(c => c.nome).join(", ")}. Débito: ${cost} Axé gravado no ledger.`,
+      timestamp: new Date().toISOString()
+    });
 
-
-
-
-
-try {
-  const geminiResult = await generateWithGeminiFallback({
-    contents: prompt,
-    systemInstruction:
-      "Você é Exu falando pelo Tarot dos Caminhos. Use obrigatoriamente as cartas sorteadas e suas traduções oficiais. Responda como leitura espiritual, não como aula.",
-  });
-
-  aiInterpretation = geminiResult.text;
-
-  console.log(
-    `[TAROT] Modelo utilizado: ${geminiResult.model}`
-  );
-
-} catch (error) {
-
-  console.error(
-    "[TAROT] Todos os modelos Gemini falharam:",
-    error
-  );
-
-  aiInterpretation =
-    TEMPLE_FALLBACKS[
-      Math.floor(Math.random() * TEMPLE_FALLBACKS.length)
-    ];
-}
-
-
-
-
-
-
-
-
-
-
-
-} catch (err: any) {
-  console.error("================================");
-  console.error("GEMINI TAROT ERROR");
-  console.error(err);
-  console.error("================================");
-
-  const fallbackCard = drawn[0];
-
-  aiInterpretation = `ERRO TAROT: ${err?.message || "desconhecido"}`;
-}
-
-db.logs.push({
-  id: "log_" + Date.now(),
-  userId,
-  action: "Oráculo - Tarot",
-  details: `Sorteio de ${slotsCount} carta(s). Cartas: ${drawn.map(c => c.nome).join(", ")}`,
-  timestamp: new Date().toISOString()
-});
-
-  await persistLatestActivityLog(db);
-  saveDb(db);
-
-  res.json({
-    success: true,
-    drawn,
-    interpretation: aiInterpretation,
-    creditsLeft: user.credits,
-xpAwarded: slotsCount === 3 ? 45 : 30,
-newLevel: user.level
-  });
-});
+    return res.json({
+      success: true,
+      drawn,
+      interpretation: aiInterpretation,
+      creditsLeft: debitResult.balanceAfter,
+      xpAwarded,
+      newLevel: debitResult.newLevel
+    });
+  }
+);
 
 // API Oracle: Numerology
 app.post(
   "/api/oraculo/numerologia",
   requireFirebaseAuth,
   requirePortalUser,
+  requireEmailVerified,
   async (req, res) => {
-  const userId = req.headers["x-user-id"] as string;
-  if (!userId) return res.status(401).json({ error: "Sessão inválida" });
+    const portalUser = (req as any).portalUser;
 
-  const userDocRef = firestore.collection("users").doc(userId);
-const userDoc = await userDocRef.get();
+    if (!await checkDurableRateLimit(`num_${portalUser.id}`, 15, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas consultas numerológicas em sequência. Aguarde um instante." });
+    }
 
-if (!userDoc.exists) {
-  return res.status(404).json({ error: "Usuário não encontrado." });
-}
+    const birthName = req.body.birthName || portalUser.birthName || portalUser.name;
+    const birthDate = req.body.birthDate || portalUser.birthDate;
 
-const user = {
-  id: userDoc.id,
-  ...userDoc.data()
-} as any;
+    if (!birthDate) {
+      return res.status(400).json({ error: "Para este oráculo, informe sua data de nascimento primeiro no painel de perfil." });
+    }
 
-const cost = 2;
+    const cost = 2;
+    const xpAwarded = 25;
 
-if (user.credits < cost) {
-  return res.status(400).json({ error: "Créditos insuficientes para calcular mapa cabalístico." });
-}
-  const birthName = req.body.birthName || user.birthName || user.name;
-  const birthDate = req.body.birthDate || user.birthDate;
+    let debitResult: any;
+    try {
+      debitResult = await executeCreditDebitTransactional({
+        userRef: portalUser.ref,
+        cost,
+        xpAwarded,
+        source: "numerologia",
+        consultationId: "num_" + Date.now(),
+      });
+    } catch (debitErr: any) {
+      return res.status(debitErr.status || 400).json({
+        error: debitErr.message || "Créditos insuficientes para calcular mapa cabalístico."
+      });
+    }
 
-  if (!birthDate) {
-    return res.status(400).json({ error: "Para este oráculo, informe sua data de nascimento primeiro no painel de perfil." });
-  }
+    // Calculate numbers
+    const numDetails = calculateNumerology(birthName, birthDate);
 
-  // Calculate numbers
-  const numDetails = calculateNumerology(birthName, birthDate);
-
-  const newCredits = user.credits - cost;
-const newXp = (user.xp || 0) + 25;
-const { level } = checkXpLevel(newXp);
-
-await userDocRef.update({
-  credits: newCredits,
-  xp: newXp,
-  level
-  }
-);
-
-user.credits = newCredits;
-user.xp = newXp;
-user.level = level;
-
-const db = loadDb();
-
-  let analysis = "";
-let response;
-
-try {
-  const ai = getGeminiClient();
-
-    
-const prompt = `
+    let analysis = "";
+    try {
+      const prompt = `
 Você é Exu realizando uma leitura numerológica dos caminhos.
 
 Não responda como professor.
@@ -3689,7 +4002,7 @@ Não explique numerologia como aula.
 Não faça relatório seco.
 
 CONSULENTE:
-${user.name || "Consulente"}
+${portalUser.name || "Consulente"}
 
 NOME DE NASCIMENTO:
 ${birthName}
@@ -3778,26 +4091,36 @@ try {
 
   } catch (err: any) {
     console.error("Gemini failed in Numerologia:", err);
-    analysis = `Seus números da sorte revelam um Caminho de Destino de força ${numDetails.destinyNumber} e uma Expressão Cósmica ${numDetails.expressionNumber}. Isto indica que os ventos do elemento ${numDetails.element} estão soprando direções favoráveis para expansão imediata de seus projetos íntimos. ${TEMPLE_FALLBACKS[2]}`;
+    try {
+      await executeCreditRefundTransactional({
+        userRef: portalUser.ref,
+        amount: cost,
+        originalOperationId: debitResult.operationId,
+        source: "numerologia",
+        reason: "Falha técnica na geração do mapa numerológico",
+      });
+      return res.status(503).json({
+        error: "Houve uma oscilação na leitura cabalística. Seus créditos de Axé foram estornados.",
+        creditsLeft: debitResult.balanceBefore,
+      });
+    } catch (refundErr) {
+      console.error("[NUMEROLOGIA] Erro no reembolso:", refundErr);
+    }
   }
 
-  db.logs.push({
-    id: "log_" + Date.now(),
-    userId,
+  await firestore.collection("activity_logs").add({
+    userId: portalUser.id,
     action: "Oráculo - Numerologia",
-    details: `Mapa Cabalístico gerado de ${birthName}. Destino ${numDetails.destinyNumber}.`,
+    details: `Mapa Cabalístico gerado de ${birthName}. Destino ${numDetails.destinyNumber}. Débito: ${cost} Axé registrado no ledger.`,
     timestamp: new Date().toISOString()
   });
 
-  await persistLatestActivityLog(db);
-  saveDb(db);
-
-  res.json({
+  return res.json({
     success: true,
     details: { ...numDetails, analysis },
-   creditsLeft: user.credits,
-xpAwarded: 25,
-newLevel: user.level
+    creditsLeft: debitResult.balanceAfter,
+    xpAwarded: 25,
+    newLevel: debitResult.newLevel
   });
 });
 
@@ -3808,31 +4131,24 @@ app.post(
   "/api/oraculo/astrologia",
   requireFirebaseAuth,
   requirePortalUser,
+  requireEmailVerified,
   async (req, res) => {
-  const userId = req.headers["x-user-id"] as string;
+    const portalUser = (req as any).portalUser;
 
-  if (!userId) {
-    return res.status(401).json({ error: "Sessão inválida" });
-  }
+    if (!await checkDurableRateLimit(`astro_${portalUser.id}`, 15, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas consultas astrológicas em sequência. Aguarde um instante." });
+    }
 
-  const userDocRef = firestore.collection("users").doc(userId);
-  const userDoc = await userDocRef.get();
+    const user = {
+      id: portalUser.id,
+      ...portalUser
+    } as any;
 
-  if (!userDoc.exists) {
-    return res.status(404).json({ error: "Usuário não encontrado." });
-  }
+    const birthDate = req.body.birthDate || user.birthDate;
 
-  const user = {
-    id: userDoc.id,
-    ...userDoc.data()
-  } as any;
-
-
-const birthDate = req.body.birthDate || user.birthDate;
-
-  if (!birthDate) {
-    return res.status(400).json({ error: "Informe sua data de nascimento." });
-  }
+    if (!birthDate) {
+      return res.status(400).json({ error: "Informe sua data de nascimento." });
+    }
 
   const zodiac = calculateZodiacProfile(birthDate);
   const spiritualProfile = calculateSpiritualProfile(
@@ -3945,43 +4261,32 @@ app.post(
   "/api/oraculo/buzios",
   requireFirebaseAuth,
   requirePortalUser,
+  requireEmailVerified,
   async (req, res) => {
-    const userId = req.headers["x-user-id"] as string;
+    const portalUser = (req as any).portalUser;
     const { question } = req.body;
 
-    if (!userId) return res.status(401).json({ error: "Sessão inválida" });
-
-    const userDocRef = firestore.collection("users").doc(userId);
-    const userDoc = await userDocRef.get();
-
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: "Usuário não encontrado." });
+    if (!await checkDurableRateLimit(`buzios_${portalUser.id}`, 15, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitos lançamentos em sequência. Aguarde um instante." });
     }
-
-    const user = {
-      id: userDoc.id,
-      ...userDoc.data()
-    } as any;
 
     const cost = 3;
+    const xpAwarded = 35;
 
-    if (Number(user.credits || 0) < cost) {
-      return res.status(400).json({ error: "Créditos insuficientes para lançar os búzios sagrados (necessário 3 Axé)." });
+    let debitResult: any;
+    try {
+      debitResult = await executeCreditDebitTransactional({
+        userRef: portalUser.ref,
+        cost,
+        xpAwarded,
+        source: "buzios",
+        consultationId: "buzios_" + Date.now(),
+      });
+    } catch (debitErr: any) {
+      return res.status(debitErr.status || 400).json({
+        error: debitErr.message || "Créditos insuficientes para lançar os búzios sagrados (necessário 3 Axé)."
+      });
     }
-
-    const newCredits = user.credits - cost;
-    const newXp = (user.xp || 0) + 35;
-    const { level } = checkXpLevel(newXp);
-
-    await userDocRef.update({
-      credits: newCredits,
-      xp: newXp,
-      level
-    });
-
-    user.credits = newCredits;
-    user.xp = newXp;
-    user.level = level;
 
     // Lançamento determinístico real de 16 conchas via CSPRNG
     const castResult = castBuzios();
@@ -3997,9 +4302,9 @@ Data: ${liturgy.dateStr}
 Momento: ${liturgy.periodOfDay} (use saudação "${liturgy.greeting}" se couber)
 
 CONSULENTE:
-Nome: ${user.name || "Consulente"}
-Nome de batismo: ${user.birthName || user.name}
-Data de nascimento: ${user.birthDate || "Não informada"}
+Nome: ${portalUser.name || "Consulente"}
+Nome de batismo: ${portalUser.birthName || portalUser.name}
+Data de nascimento: ${portalUser.birthDate || "Não informada"}
 
 PERGUNTA OU FOCO DO CONSULENTE:
 "${question || "Direcionamento e abertura de caminhos gerais"}"
@@ -4030,38 +4335,38 @@ REGRAS RÍGIDAS DE INTERPRETAÇÃO:
     } catch (err) {
       console.error("[BUZIOS] Falha ao gerar interpretação com Gemini:", err);
 
-      // Em caso de falha de todos os modelos, realiza estorno transacional dos créditos
-      await userDocRef.update({
-        credits: user.credits + cost,
-        xp: Math.max(0, user.xp - 35),
-        level: user.level
-      });
-      user.credits += cost;
-
-      return res.status(503).json({
-        error: "Ocorreu uma oscilação na comunicação espiritual. Seus créditos de Axé foram integralmente preservados.",
-        creditsLeft: user.credits
-      });
+      try {
+        await executeCreditRefundTransactional({
+          userRef: portalUser.ref,
+          amount: cost,
+          originalOperationId: debitResult.operationId,
+          source: "buzios",
+          reason: "Falha de comunicação no lançamento de búzios",
+        });
+        return res.status(503).json({
+          error: "Ocorreu uma oscilação na comunicação espiritual. Seus créditos de Axé foram integralmente preservados e estornados.",
+          creditsLeft: debitResult.balanceBefore
+        });
+      } catch (refundErr) {
+        console.error("[BUZIOS] Erro no reembolso:", refundErr);
+        interpretation = "As águas sagradas acolheram seu pedido. Os búzios apontam caminhos de equilíbrio e proteção.";
+      }
     }
 
-    const db = loadDb();
-    db.logs.push({
-      id: "log_" + Date.now(),
-      userId,
+    await firestore.collection("activity_logs").add({
+      userId: portalUser.id,
       action: "Oráculo - Búzios 16 Conchas",
-      details: `Lançamento: ${castResult.abertosCount} abertos. Odù ${castResult.odu.nome}.`,
+      details: `Lançamento: ${castResult.abertosCount} abertos. Odù ${castResult.odu.nome}. Débito: ${cost} Axé registrado no ledger.`,
       timestamp: new Date().toISOString()
     });
-    await persistLatestActivityLog(db);
-    saveDb(db);
 
     return res.json({
       success: true,
       castResult,
       interpretation,
-      creditsLeft: user.credits,
-      xpAwarded: 35,
-      newLevel: user.level
+      creditsLeft: debitResult.balanceAfter,
+      xpAwarded,
+      newLevel: debitResult.newLevel
     });
   }
 );
@@ -4074,10 +4379,14 @@ app.post(
   requireFirebaseAuth,
   requirePortalUser,
   async (req, res) => {
-  const userId = req.headers["x-user-id"] as string;
-  const { planId } = req.body;
+    const portalUser = (req as any).portalUser;
 
-  if (!userId) return res.status(401).json({ error: "Sessão inválida" });
+    if (!await checkDurableRateLimit(`buy_${portalUser.id}`, 10, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas solicitações de compra em sequência. Aguarde alguns instantes." });
+    }
+
+    const userId = portalUser.id;
+    const { planId } = req.body;
 
   const plans: Record<string, any> = {
   prata: {
@@ -4154,6 +4463,11 @@ payment_methods: {
 
 // Mercado Pago webhook - automatic credit confirmation
 app.post("/api/mercadopago/webhook", async (req, res) => {
+  const clientIp = getClientIp(req);
+  if (!await checkDurableRateLimit(`webhook_${clientIp}`, 60, 60 * 1000)) {
+    return res.status(429).json({ error: "Taxa limite de requisições excedida." });
+  }
+
   try {
     const paymentId =
       req.body?.data?.id ||
@@ -4268,6 +4582,24 @@ app.post("/api/mercadopago/webhook", async (req, res) => {
         status: "credited",
         createdAt: new Date().toISOString()
       });
+
+      const ledgerRef = firestore.collection("credit_ledger").doc(`pay_${paymentId}`);
+      transaction.set(ledgerRef, {
+        operationId: `pay_${paymentId}`,
+        userId: String(userId),
+        firebaseUid: userData.firebaseUid || "",
+        type: "payment",
+        amount: credits,
+        balanceBefore: currentCredits,
+        balanceAfter: currentCredits + credits,
+        status: "committed",
+        source: "mercadopago",
+        paymentId: String(paymentId),
+        planId,
+        createdAt: new Date().toISOString(),
+        committedAt: new Date().toISOString(),
+        idempotencyKey: `pay_${paymentId}`
+      });
     });
 
     return res.status(200).json({ received: true, credited: true });
@@ -4301,31 +4633,25 @@ app.get(
   requirePortalUser,
   requirePortalAdmin,
   async (req, res) => {
-  const userId = req.headers["x-user-id"] as string;
+    const portalUser = (req as any).portalUser;
 
-  if (!userId) {
-    return res.status(401).json({ error: "Não logado" });
-  }
+    if (!await checkDurableRateLimit(`admin_${portalUser.id}`, 60, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas requisições administrativas. Aguarde um instante." });
+    }
 
-  const adminDoc = await firestore.collection("users").doc(userId).get();
+    const usersSnapshot = await firestore.collection("users").get();
 
-  if (!adminDoc.exists || adminDoc.data()?.role !== "admin") {
-    return res.status(403).json({ error: "Acesso administrativo restrito aos guardiões." });
-  }
+    const users = usersSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
 
-  const usersSnapshot = await firestore.collection("users").get();
+    const activityLogs = await loadRecentActivityLogs();
 
-  const users = usersSnapshot.docs.map(doc => ({
-    id: doc.id,
-    ...doc.data()
-  }));
-
-  const activityLogs = await loadRecentActivityLogs();
-
-  res.json({
-    seekers: users,
-    logs: activityLogs
-  });
+    return res.json({
+      seekers: users,
+      logs: activityLogs
+    });
   }
 );
 
@@ -4336,40 +4662,34 @@ app.get(
   requirePortalUser,
   requirePortalAdmin,
   async (req, res) => {
-  const userId = req.headers["x-user-id"] as string;
+    const portalUser = (req as any).portalUser;
 
-  if (!userId) {
-    return res.status(401).json({ error: "Não logado" });
-  }
+    if (!await checkDurableRateLimit(`admin_${portalUser.id}`, 60, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas requisições administrativas. Aguarde um instante." });
+    }
 
-  const adminDoc = await firestore.collection("users").doc(userId).get();
+    const usersSnapshot = await firestore.collection("users").get();
 
-  if (!adminDoc.exists || adminDoc.data()?.role !== "admin") {
-    return res.status(403).json({ error: "Acesso administrativo restrito." });
-  }
+    const users = usersSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    })) as any[];
 
-  const usersSnapshot = await firestore.collection("users").get();
+    const activityLogs = await loadRecentActivityLogs();
+    const knowledgeItems = await loadKnowledgeItems();
 
-  const users = usersSnapshot.docs.map(doc => ({
-    id: doc.id,
-    ...doc.data()
-  })) as any[];
+    const stats = {
+      totalSeekers: users.length,
+      totalCreditsInCirculation: users.reduce((acc, u) => acc + Number(u.credits || 0), 0),
+      totalXpAccumulated: users.reduce((acc, u) => acc + Number(u.xp || 0), 0),
+      totalLogs: activityLogs.length,
+      knowledgeItemsCount: knowledgeItems.length
+    };
 
-  const activityLogs = await loadRecentActivityLogs();
-  const knowledgeItems = await loadKnowledgeItems();
-
-  const stats = {
-    totalSeekers: users.length,
-    totalCreditsInCirculation: users.reduce((acc, u) => acc + Number(u.credits || 0), 0),
-    totalXpAccumulated: users.reduce((acc, u) => acc + Number(u.xp || 0), 0),
-    totalLogs: activityLogs.length,
-    knowledgeItemsCount: knowledgeItems.length
-  };
-
-  res.json({
-    stats,
-    logs: activityLogs.slice(0, 30)
-  });
+    return res.json({
+      stats,
+      logs: activityLogs.slice(0, 30)
+    });
   }
 );
 
@@ -4379,9 +4699,15 @@ app.get(
   requireFirebaseAuth,
   requirePortalUser,
   requirePortalAdmin,
-  async (_req, res) => {
-  const knowledgeItems = await loadKnowledgeItems();
-  res.json({ library: knowledgeItems });
+  async (req, res) => {
+    const portalUser = (req as any).portalUser;
+
+    if (!await checkDurableRateLimit(`admin_${portalUser.id}`, 60, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas requisições administrativas. Aguarde um instante." });
+    }
+
+    const knowledgeItems = await loadKnowledgeItems();
+    return res.json({ library: knowledgeItems });
   }
 );
 
@@ -4391,45 +4717,105 @@ app.post(
   requirePortalUser,
   requirePortalAdmin,
   async (req, res) => {
-  const userId = req.headers["x-user-id"] as string;
-  const { title, category, content, tags } = req.body;
+    const portalUser = (req as any).portalUser;
 
-  if (!userId) return res.status(401).json({ error: "Id ausente" });
-const adminDoc = await firestore.collection("users").doc(userId).get();
+    if (!await checkDurableRateLimit(`admin_${portalUser.id}`, 60, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas requisições administrativas. Aguarde um instante." });
+    }
 
-if (!adminDoc.exists || adminDoc.data()?.role !== "admin") {
-  return res.status(403).json({ error: "Somente administradores podem alimentar a biblioteca do Ifá." });
-}
+    const { title, category, content, tags } = req.body;
 
-const db = loadDb();
+    if (!title || !content) {
+      return res.status(400).json({ error: "Título e conteúdo são obrigatórios." });
+    }
 
-  const newItem = {
-    id: "kb_custom_" + Date.now(),
-    title,
-    category,
-    content,
-    tags: tags ? tags.split(",").map((t: string) => t.trim().toLowerCase()) : [],
-    createdAt: new Date().toISOString()
-  };
+    const newItem = {
+      id: "kb_custom_" + Date.now(),
+      title,
+      category: category || "geral",
+      content,
+      tags: tags ? tags.split(",").map((t: string) => t.trim().toLowerCase()) : [],
+      createdAt: new Date().toISOString()
+    };
 
-  db.knowledge.push(newItem);
-  await firestore.collection("knowledge").doc(newItem.id).set(newItem);
-  db.logs.push({
-    id: "log_" + Date.now(),
-    userId,
-    action: "Adicionado à Biblioteca",
-    details: `Sábio ensinamento cadastrado para RAG: "${title}"`,
-    timestamp: new Date().toISOString()
-  });
+    await firestore.collection("knowledge").doc(newItem.id).set(newItem);
 
-  await persistLatestActivityLog(db);
-  saveDb(db);
-  res.json({ success: true, item: newItem });
+    await firestore.collection("activity_logs").add({
+      userId: portalUser.id,
+      action: "Adicionado à Biblioteca",
+      details: `Sábio ensinamento cadastrado para RAG: "${title}"`,
+      timestamp: new Date().toISOString()
+    });
+
+    return res.json({ success: true, item: newItem });
   }
 );
 
-// In-memory rate limiting store for chat inquiries
-const userRequestTimestamps: Record<string, number[]> = {};
+// Admin API - Credit Adjustments with Transactional Ledger
+app.post(
+  "/api/admin/credits/adjust",
+  requireFirebaseAuth,
+  requirePortalUser,
+  requirePortalAdmin,
+  async (req, res) => {
+    const portalUser = (req as any).portalUser;
+
+    if (!await checkDurableRateLimit(`admin_${portalUser.id}`, 60, 60 * 1000)) {
+      return res.status(429).json({ error: "Muitas requisições administrativas. Aguarde um instante." });
+    }
+
+    const { targetUserId, amount, reason } = req.body;
+    const numericAmount = Number(amount);
+
+    if (!targetUserId || !numericAmount || isNaN(numericAmount)) {
+      return res.status(400).json({ error: "Informe o targetUserId e o valor numérico de créditos." });
+    }
+
+    const targetRef = firestore.collection("users").doc(String(targetUserId));
+    const operationId = "op_adj_" + Date.now() + "_" + Math.random().toString(36).substring(2, 9);
+    const now = new Date().toISOString();
+
+    try {
+      const result = await firestore.runTransaction(async (transaction: any) => {
+        const targetDoc = await transaction.get(targetRef);
+        if (!targetDoc.exists) {
+          throw new Error("Buscador destinatário não encontrado.");
+        }
+        const targetData = targetDoc.data() || {};
+        const currentCredits = Number(targetData.credits || 0);
+        const balanceAfter = Math.max(0, currentCredits + numericAmount);
+
+        transaction.update(targetRef, {
+          credits: balanceAfter,
+          updatedAt: now
+        });
+
+        const ledgerRef = firestore.collection("credit_ledger").doc(operationId);
+        transaction.set(ledgerRef, {
+          operationId,
+          userId: targetDoc.id,
+          firebaseUid: targetData.firebaseUid || "",
+          adminId: portalUser.id,
+          type: "adjustment",
+          amount: numericAmount,
+          balanceBefore: currentCredits,
+          balanceAfter,
+          status: "committed",
+          source: "admin",
+          reason: String(reason || "Ajuste manual pelo guardião administrador"),
+          createdAt: now,
+          committedAt: now
+        });
+
+        return { balanceBefore: currentCredits, balanceAfter };
+      });
+
+      return res.json({ success: true, operationId, ...result });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message || "Falha ao ajustar créditos." });
+    }
+  }
+);
 
 // Simulated RAG and Main Chat Executor API (Proxying Gemini Server-Side)
 
@@ -4437,19 +4823,13 @@ const userRequestTimestamps: Record<string, number[]> = {};
 
 
 app.post(
-  "/api/exu/chat",
+  ["/api/exu/chat", "/api/chat"],
   requireFirebaseAuth,
+  requirePortalUser,
+  requireEmailVerified,
   async (req, res) => {
-    const firebaseUser =
-      (req as any).firebaseUser as DecodedIdToken;
-
+    const portalUser = (req as any).portalUser;
     const { text } = req.body;
-
-    if (!firebaseUser?.uid) {
-      return res.status(401).json({
-        error: "Sessão Firebase inválida."
-      });
-    }
 
     if (!text || !String(text).trim()) {
       return res.status(400).json({
@@ -4457,65 +4837,18 @@ app.post(
       });
     }
 
-    const firebaseEmail =
-      typeof firebaseUser.email === "string"
-        ? firebaseUser.email.trim().toLowerCase()
-        : "";
-
-    const db = loadDb();
-    db.knowledge = await loadKnowledgeItems();
-
-    let userSnapshot = await firestore
-      .collection("users")
-      .where("firebaseUid", "==", firebaseUser.uid)
-      .limit(1)
-      .get();
-
-    // Compatibilidade com contas antigas ainda sem firebaseUid
-    if (userSnapshot.empty && firebaseEmail) {
-      userSnapshot = await firestore
-        .collection("users")
-        .where("email", "==", firebaseEmail)
-        .limit(1)
-        .get();
-    }
-
-    if (userSnapshot.empty) {
-      return res.status(404).json({
-        error: "Buscador não encontrado."
+    if (!await checkDurableRateLimit(`chat_${portalUser.id}`, 20, 60 * 1000)) {
+      return res.status(429).json({
+        error: "Muitas mensagens em sequência. Aguarde alguns instantes."
       });
-    }
-
-    const userDoc = userSnapshot.docs[0];
-    const userRef = userDoc.ref;
-    const userData = userDoc.data() as any;
-
-    if (
-      userData.firebaseUid &&
-      userData.firebaseUid !== firebaseUser.uid
-    ) {
-      return res.status(403).json({
-        error:
-          "Esta conta está vinculada a outra identidade Firebase."
-      });
-    }
-
-    if (!userData.firebaseUid) {
-      await userRef.set(
-        {
-          firebaseUid: firebaseUser.uid,
-          emailVerified: Boolean(firebaseUser.email_verified),
-          updatedAt: new Date().toISOString()
-        },
-        { merge: true }
-      );
     }
 
     const user = {
-      id: userDoc.id,
-      ...userData,
-      firebaseUid: firebaseUser.uid
+      id: portalUser.id,
+      ...portalUser,
+      firebaseUid: portalUser.firebaseUid
     } as any;
+    const userRef = portalUser.ref;
 
 
 
@@ -4576,10 +4909,7 @@ if (isOnlySocialMessage) {
     timestamp: now
   };
 
-  db.messages.push(userMessage, exuMessage);
   await persistMessages([userMessage, exuMessage]);
-
-  saveDb(db);
 
   return res.json({
     success: true,
@@ -4720,37 +5050,28 @@ if (consultationType === "outros") {
 
 
 // Validate Credits
-if (
-  shouldChargeCredit &&
-  Number(user.credits || 0) < creditsCost
-) {
-  return res.status(400).json({
-    error:
-      `Você precisa de ${creditsCost} créditos de Axé para realizar esta consulta.`
-  });
-}
-
-
-// Deduct Credits & Award XP
+// Transactional Axé Credits Debit & XP
+let debitResult: any = null;
 if (shouldChargeCredit) {
-  const newCredits =
-    Number(user.credits || 0) - creditsCost;
-
-  const newXp =
-    Number(user.xp || 0) + xpAwarded;
-
-  const { level } =
-    checkXpLevel(newXp);
-
-  await userRef.update({
-    credits: newCredits,
-    xp: newXp,
-    level
-  });
-
-  user.credits = newCredits;
-  user.xp = newXp;
-  user.level = level;
+  try {
+    debitResult = await executeCreditDebitTransactional({
+      userRef: portalUser.ref,
+      cost: creditsCost,
+      xpAwarded,
+      source: "chat",
+      consultationId: "chat_" + Date.now(),
+    });
+    user.credits = debitResult.balanceAfter;
+    user.xp = debitResult.newXp;
+    user.level = debitResult.newLevel;
+  } catch (debitErr: any) {
+    return res.status(debitErr.status || 400).json({
+      error:
+        debitErr.message ||
+        `Você precisa de ${creditsCost} créditos de Axé para realizar esta consulta.`,
+      creditsLeft: debitErr.available !== undefined ? debitErr.available : user.credits,
+    });
+  }
 }
 
 
@@ -4962,19 +5283,14 @@ if (compatibilityData) {
     timestamp: compatibilityTimestamp
   };
 
-  db.messages.push(userMessage, exuMessage);
   await persistMessages([userMessage, exuMessage]);
 
-  db.logs.push({
-    id: "log_" + Date.now(),
+  await firestore.collection("activity_logs").add({
     userId: user.id,
     action: "Compatibilidade espiritual realizada",
     details: `Buscador comparou compatibilidade com ${compatibilityData.name}.`,
-    timestamp: new Date().toISOString()
+    timestamp: compatibilityTimestamp
   });
-
-  await persistLatestActivityLog(db);
-  saveDb(db);
 
   return res.json({
     success: true,
@@ -5025,7 +5341,8 @@ const detectMainTheme = (text: string) => {
 
 const mainTheme = detectMainTheme(promptLower);
 
-const scoredKnowledge = db.knowledge
+const knowledgeItems = await loadKnowledgeItems();
+const scoredKnowledge = knowledgeItems
   .map((item: any) => {
     const title = normalizeText(item.title || "");
     const category = normalizeText(item.category || "");
@@ -5461,9 +5778,8 @@ Nunca pareça uma IA.
 Pareça Exu conversando.
 `;
 
-const recentMessages = db.messages
-  .filter((msg: any) => msg.userId === user.id)
-  .slice(-8)
+const userRecentMsgs = await loadRecentUserMessages(user.id, 8);
+const recentMessages = userRecentMsgs
   .map((msg: any) => {
     const speaker = msg.sender === "user" ? "Consulente" : "Exu Responde";
     return `${speaker}: ${msg.text}`;
@@ -5587,11 +5903,26 @@ try {
 
   } catch (err: any) {
     console.error("Gemini Failure in chat:", err);
-    finalResponseText = TEMPLE_FALLBACKS[Math.floor(Math.random() * TEMPLE_FALLBACKS.length)] +
-      " (Os deuses sopraram um retiro de silêncio místico em nossa inteligência atual. Volte a nos consultar em instantes...)";
+    if (debitResult) {
+      try {
+        await executeCreditRefundTransactional({
+          userRef: portalUser.ref,
+          amount: creditsCost,
+          originalOperationId: debitResult.operationId,
+          source: "chat",
+          reason: "Falha de comunicação no terreiro virtual",
+        });
+        user.credits = debitResult.balanceBefore;
+      } catch (refErr) {
+        console.error("[CHAT] Erro ao estornar crédito do chat:", refErr);
+      }
+    }
+    finalResponseText =
+      TEMPLE_FALLBACKS[Math.floor(Math.random() * TEMPLE_FALLBACKS.length)] +
+      " (Os ventos sagrados pedem paciência neste instante. Seus créditos foram devidamente preservados.)";
   }
 
-  // Save conversation log internally
+  // Save conversation log in Firestore
   const userMsgId = "msg_u_" + Date.now();
   const botMsgId = "msg_b_" + (Date.now() + 1);
   const messageTimestamp = new Date().toISOString();
@@ -5612,38 +5943,25 @@ try {
     timestamp: messageTimestamp
   };
 
-  db.messages.push(userMessage, exuMessage);
   await persistMessages([userMessage, exuMessage]);
 
-  db.logs.push({
-  id: "log_" + Date.now(),
-  userId: user.id,
-  action: "Pergunta realizada ao Terreiro",
-  details: `Buscador gastou ${creditsCost} créditos. Text: "${text.substring(0, 30)}..."`,
-  timestamp: new Date().toISOString()
-});
-
-await persistLatestActivityLog(db);
-saveDb(db);
-
-return res.json({
-  success: true,
-  userMessage: {
-    id: userMsgId,
-    sender: "user",
-    text,
+  await firestore.collection("activity_logs").add({
+    userId: user.id,
+    action: "Pergunta realizada ao Terreiro",
+    details: shouldChargeCredit
+      ? `Buscador realizou consulta de ${creditsCost} créditos. Ledger: ${debitResult?.operationId || "isento"}.`
+      : "Interação de cortesia/saudação.",
     timestamp: messageTimestamp
-  },
-  exuMessage: {
-    id: botMsgId,
-    sender: "exu",
-    text: finalResponseText,
-    timestamp: messageTimestamp
-  },
-  creditsLeft: user.credits,
-  xpAwarded,
-  newLevel: user.level
-});
+  });
+
+  return res.json({
+    success: true,
+    userMessage,
+    exuMessage,
+    creditsLeft: user.credits,
+    xpAwarded: shouldChargeCredit ? xpAwarded : 0,
+    newLevel: user.level
+  });
 });
 
 // Vite server development middleware setup or production static bundle delivery

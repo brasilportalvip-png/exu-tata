@@ -2,34 +2,38 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // DENY ALL by default
+    // DENY ALL por padrão para máxima segurança
     match /{document=**} {
       allow read, write: if false;
     }
 
     // Regras da Coleção de Usuários
+    // Todas as mutações e deduções de créditos são efetuadas com segurança pela API do servidor
     match /users/{userId} {
-      // O próprio usuário autenticado pode ler seu perfil
-      allow read: if request.auth != null && request.auth.uid == resource.data.firebaseUid;
+      // O próprio usuário autenticado pode ler seu próprio documento
+      allow read: if request.auth != null && (
+        request.auth.uid == resource.data.firebaseUid || request.auth.uid == userId
+      );
 
-      // O cliente NÃO pode alterar créditos, cargos, flags de segurança ou bloqueio
-      // Somente atualizações de dados cadastrais básicos de perfil sem alterar créditos/role
-      allow update: if request.auth != null
-        && request.auth.uid == resource.data.firebaseUid
-        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['credits', 'role', 'isAdmin', 'isBlocked', 'fraudScore', 'promotionalCreditsBlocked', 'fraudReasons']);
+      // Nenhuma escrita direta pelo cliente. Todas as alterações passam pela API do backend.
+      allow write: if false;
+    }
 
-      // Criação inicial é mediada pela API do servidor
-      allow create, delete: if false;
+    // Livro-Razão de Créditos (Transacional / Imutável) - Exclusivo do Servidor
+    match /credit_ledger/{entry} {
+      allow read, write: if false;
     }
 
     // Regras de Mensagens / Consultas
     match /messages/{messageId} {
-      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
-      // Criação e edição de mensagens apenas pelo servidor autenticado
+      allow read: if request.auth != null && (
+        request.auth.uid == resource.data.userId || request.auth.uid == resource.data.firebaseUid
+      );
+      // Escrita mediada unicamente pela API do servidor
       allow write: if false;
     }
 
-    // Acervo de Sabedoria / Biblioteca
+    // Acervo de Sabedoria / Biblioteca / RAG
     match /knowledge/{itemId} {
       allow read: if true;
       allow write: if false;
@@ -53,6 +57,14 @@ service cloud.firestore {
     }
 
     match /security_logs/{logId} {
+      allow read, write: if false;
+    }
+
+    match /idempotency_keys/{keyId} {
+      allow read, write: if false;
+    }
+
+    match /rate_limits/{limitId} {
       allow read, write: if false;
     }
   }

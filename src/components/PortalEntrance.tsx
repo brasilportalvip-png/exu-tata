@@ -51,8 +51,7 @@ export default function PortalEntrance({ onLoginSuccess }: PortalEntranceProps) 
 
   // Anti-abuse security & verification states
   const [honeypot, setHoneypot] = useState("");
-  const [captchaAnswer, setCaptchaAnswer] = useState("");
-   const [sessionSign, setSessionSign] = useState("");
+  const [sessionSign, setSessionSign] = useState("");
 
   // Generate device Fingerprint tracking
   const getDeviceFingerprint = () => {
@@ -106,13 +105,6 @@ export default function PortalEntrance({ onLoginSuccess }: PortalEntranceProps) 
       return;
     }
 
-    if (!captchaAnswer || parseInt(captchaAnswer) !== 7) {
-      setError(
-        "A resposta do desafio antibot está incorreta. Quanto é 4 + 3?"
-      );
-      return;
-    }
-
     setLoading(true);
 
     if (soundEnabled) {
@@ -145,7 +137,6 @@ export default function PortalEntrance({ onLoginSuccess }: PortalEntranceProps) 
           deviceId: getDeviceFingerprint(),
           browser: navigator.userAgent,
           session: sessionSign,
-          captchaAnswer,
           honeypot
         })
       });
@@ -653,26 +644,6 @@ export default function PortalEntrance({ onLoginSuccess }: PortalEntranceProps) 
                     tabIndex={-1}
                     autoComplete="off"
                   />
-                </div>
-
-                {/* Interactive Mathematical Anti-bot Captcha */}
-                <div className="mt-4 p-3 bg-red-950/20 rounded-xl border border-red-950/45 text-left">
-                  <label className="block text-[10px] font-mono font-bold tracking-widest text-zinc-300 uppercase mb-1.5 flex items-center gap-1.5">
-                    🛡️ Desafio de Segurança (Anti-robô)
-                  </label>
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-xs font-mono text-zinc-400">Quanto é 4 + 3?</span>
-                    <input
-                      type="text"
-                      required
-                      maxLength={2}
-                      value={captchaAnswer}
-                      disabled={loading}
-                      onChange={(e) => setCaptchaAnswer(e.target.value)}
-                      placeholder="?"
-                      className="w-16 px-2 py-1.5 rounded border border-zinc-850 bg-black text-center text-xs font-bold font-mono text-yellow-500 focus:outline-none focus:border-yellow-500"
-                    />
-                  </div>
                 </div>
 
                 <button
