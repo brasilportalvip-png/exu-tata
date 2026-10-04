@@ -893,7 +893,7 @@ export default function PortalEntrance({ onLoginSuccess }: PortalEntranceProps) 
         {/* Traditional Ethos Disclosure */}
         <div className="mt-4 text-[10px] text-zinc-400 space-y-2.5 leading-relaxed max-w-sm px-4 bg-black/40 p-3.5 rounded-2xl backdrop-blur-md border border-zinc-900/60 uppercase font-mono tracking-wider text-center">
           <p className="text-zinc-500">
-            O oráculo de Exu oferece leituras simbólicas ancestrais voltadas ao autoconhecimento, à cultura afro-diaspórica e espiritualidade.
+            O oráculo de Exu oferece consultas e orientações ancestrais voltadas ao autoconhecimento, à tradição de terreiro e aos caminhos da vida.
           </p>
           <div className="flex justify-center gap-4 text-[9px] text-zinc-500">
             <span>🛡️ SEGURO</span>

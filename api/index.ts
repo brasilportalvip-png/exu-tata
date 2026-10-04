@@ -839,24 +839,29 @@ function getGeminiClient(): GoogleGenAI {
 // MODELOS GEMINI — ORDEM DE PRIORIDADE E FALLBACK
 // ======================================================
 
+// ======================================================
+// MODELOS GEMINI — ORDEM DE PRIORIDADE E FALLBACK (RESILIÊNCIA ANTIQUEDA)
+// ======================================================
+
 const GEMINI_MODELS = [
   process.env.GEMINI_PRIMARY_MODEL?.trim() || "gemini-3.8-flash",
   process.env.GEMINI_SECONDARY_MODEL?.trim() || "gemini-3.7-flash",
   process.env.GEMINI_LITE_MODEL?.trim() || "gemini-3.6-flash",
   "gemini-2.5-flash",
-  "gemini-2.0-flash",
-].filter((model): model is string => Boolean(model));
+].filter((model, index, arr): model is string => Boolean(model) && arr.indexOf(model) === index);
 
 type GeminiModelName = string;
 
 type GeminiSafeResult = {
   text: string;
   model: GeminiModelName;
+  fallbackCount: number;
+  fallbackReasons: string[];
 };
 
-const GEMINI_REQUEST_TIMEOUT_MS = 45_000;
-const GEMINI_MAX_RETRIES_PER_MODEL = 1;
-const GEMINI_FALLBACK_DELAY_MS = 2_000;
+const GEMINI_GLOBAL_TIMEOUT_MS = 45_000;
+const GEMINI_REQUEST_TIMEOUT_MS = 20_000;
+const GEMINI_MAX_RETRIES_PER_MODEL = 2; // Até 2 tentativas por modelo apenas se for erro recuperável
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -905,33 +910,10 @@ function isRetryableGeminiError(error: unknown): boolean {
     message.includes("rate limit") ||
     message.includes("resource exhausted") ||
     message.includes("temporarily unavailable") ||
-    message.includes("service unavailable")
+    message.includes("service unavailable") ||
+    message.includes("503") ||
+    message.includes("429")
   );
-}
-
-async function withGeminiTimeout<T>(
-  request: Promise<T>,
-  timeoutMs = GEMINI_REQUEST_TIMEOUT_MS
-): Promise<T> {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(
-        new Error(
-          `Gemini excedeu o limite de ${Math.round(timeoutMs / 1000)} segundos.`
-        )
-      );
-    }, timeoutMs);
-  });
-
-  try {
-    return await Promise.race([request, timeoutPromise]);
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-  }
 }
 
 async function generateWithGeminiFallback(params: {
@@ -940,27 +922,60 @@ async function generateWithGeminiFallback(params: {
 }): Promise<GeminiSafeResult> {
   const ai = getGeminiClient();
   const errors: string[] = [];
+  const fallbackReasons: string[] = [];
+  const startTime = Date.now();
+  let fallbackCount = 0;
 
-  for (const model of GEMINI_MODELS) {
+  for (let modelIndex = 0; modelIndex < GEMINI_MODELS.length; modelIndex++) {
+    const model = GEMINI_MODELS[modelIndex];
+
     for (
       let attempt = 1;
       attempt <= GEMINI_MAX_RETRIES_PER_MODEL;
       attempt++
     ) {
+      const elapsed = Date.now() - startTime;
+      const remainingBudget = GEMINI_GLOBAL_TIMEOUT_MS - elapsed;
+      if (remainingBudget < 3000) {
+        throw new Error(
+          `Orçamento global de tempo (${Math.round(GEMINI_GLOBAL_TIMEOUT_MS / 1000)}s) esgotado para esta consulta.`
+        );
+      }
+
+      const requestTimeout = Math.min(GEMINI_REQUEST_TIMEOUT_MS, remainingBudget);
+      const controller = new AbortController();
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          controller.abort();
+          reject(
+            new Error(
+              `Tempo limite excedido (${Math.round(requestTimeout / 1000)}s) no modelo ${model}.`
+            )
+          );
+        }, requestTimeout);
+      });
+
       try {
         console.log(
           `[GEMINI] Modelo=${model} tentativa=${attempt}/${GEMINI_MAX_RETRIES_PER_MODEL}`
         );
 
-        const response = await withGeminiTimeout(
-          ai.models.generateContent({
-            model,
-            contents: params.contents,
-            config: {
-              systemInstruction: params.systemInstruction,
-            },
-          })
-        );
+        const generatePromise = ai.models.generateContent({
+          model,
+          contents: params.contents,
+          config: {
+            systemInstruction: params.systemInstruction,
+            abortSignal: controller.signal
+          },
+        });
+
+        const response = await Promise.race([generatePromise, timeoutPromise]);
+
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
 
         const text =
           typeof response?.text === "string"
@@ -971,13 +986,19 @@ async function generateWithGeminiFallback(params: {
           throw new Error(`O modelo ${model} retornou resposta vazia.`);
         }
 
-        console.log(`[GEMINI] Resposta concluída por ${model}.`);
+        console.log(`[GEMINI] Resposta concluída com sucesso por ${model}.`);
 
         return {
           text,
           model,
+          fallbackCount,
+          fallbackReasons
         };
       } catch (error) {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+
         const message =
           error instanceof Error
             ? error.message
@@ -987,29 +1008,42 @@ async function generateWithGeminiFallback(params: {
 
         errors.push(`${model}, tentativa ${attempt}: ${message}`);
 
-        console.error(
-          `[GEMINI] Falha no modelo ${model}, tentativa ${attempt}:`,
-          error
+        console.warn(
+          `[GEMINI] Falha no modelo ${model}, tentativa ${attempt}: ${message}`
         );
 
-        break;
+        if (!retryable) {
+          fallbackReasons.push(`${model}: Erro definitivo não recuperável (${message})`);
+          break; // Não retenta erros como 400/401/403 ou modelo inexistente
+        }
+
+        if (attempt >= GEMINI_MAX_RETRIES_PER_MODEL) {
+          fallbackReasons.push(`${model}: Esgotadas ${GEMINI_MAX_RETRIES_PER_MODEL} tentativas (${message})`);
+          break;
+        }
+
+        // Exponential backoff com jitter
+        const jitter = Math.floor(Math.random() * 400);
+        const delay = Math.min(3000, 800 * Math.pow(2, attempt - 1) + jitter);
+        await sleep(delay);
       }
     }
 
-    console.warn(`[GEMINI] Mudando do modelo ${model} para o próximo.`);
-
-const currentModelIndex = GEMINI_MODELS.indexOf(model);
-
-if (currentModelIndex < GEMINI_MODELS.length - 1) {
-  await sleep(GEMINI_FALLBACK_DELAY_MS);
-}
+    if (modelIndex < GEMINI_MODELS.length - 1) {
+      fallbackCount++;
+      console.warn(`[GEMINI] Acionando fallback: ${model} -> ${GEMINI_MODELS[modelIndex + 1]}`);
+      await sleep(1000);
+    }
   }
 
-  console.error("[GEMINI] Todos os modelos falharam:", errors);
+  console.error("[GEMINI] Todos os modelos da hierarquia falharam:", errors);
 
-  throw new Error(
-    "Todos os modelos Gemini estão temporariamente indisponíveis."
+  const failureError: any = new Error(
+    "Todos os modelos da esteira de inteligência espiritual falharam."
   );
+  failureError.code = "ALL_GEMINI_MODELS_FAILED";
+  failureError.details = errors;
+  throw failureError;
 }
 
 

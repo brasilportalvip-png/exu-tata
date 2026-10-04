@@ -24,13 +24,14 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Regras de Mensagens / Consultas
+    // Regras de Mensagens / Consultas - Servidas com segurança exclusiva pela API do backend
     match /messages/{messageId} {
-      allow read: if request.auth != null && (
-        request.auth.uid == resource.data.userId || request.auth.uid == resource.data.firebaseUid
-      );
-      // Escrita mediada unicamente pela API do servidor
-      allow write: if false;
+      allow read, write: if false;
+    }
+
+    // Pedidos do Mercado Pago (Servidor autoritário)
+    match /orders/{orderId} {
+      allow read, write: if false;
     }
 
     // Acervo de Sabedoria / Biblioteca / RAG

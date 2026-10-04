@@ -687,10 +687,9 @@ setUser({
                     }`}>
                       {isExu ? (
                         <img 
-                          src="https://portalvipbrasil.com.br/wp-content/uploads/2026/05/ChatGPT-Image-29-de-mai.-de-2026-09_27_07.png" 
+                          src="/images/Exu Responde Logo.png" 
                           alt="Exu Responde" 
                           className="w-full h-full object-cover" 
-                          referrerPolicy="no-referrer"
                         />
                       ) : (
                         "🕊️"
@@ -758,10 +757,9 @@ setUser({
               <div className="flex gap-3 justify-start mr-auto max-w-[80%]">
                 <div className="w-8 h-8 rounded-full bg-black border border-red-900 text-yellow-500 flex items-center justify-center shrink-0 animate-pulse text-xs overflow-hidden">
                   <img 
-                    src="https://portalvipbrasil.com.br/wp-content/uploads/2026/05/ChatGPT-Image-29-de-mai.-de-2026-09_27_07.png" 
+                    src="/images/Exu Responde Logo.png" 
                     alt="Exu Responde" 
                     className="w-full h-full object-cover" 
-                    referrerPolicy="no-referrer"
                   />
                 </div>
                 <div className="bg-zinc-900/60 border border-zinc-800/60 p-3.5 rounded-2xl rounded-tl-none flex items-center gap-1">

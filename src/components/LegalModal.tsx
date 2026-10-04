@@ -86,11 +86,11 @@ export default function LegalModal({ initialTab = "termos", isOpen, onClose }: L
                 </p>
                 <h4 className="text-xs font-bold text-amber-200 uppercase font-mono">2. Natureza dos Serviços</h4>
                 <p>
-                  O Exu Responde é uma plataforma digital e lúdica de reflexão, orientação e sabedoria ancestral baseada nas tradições afro-diaspóricas de Ifá, oráculos dos Odùs, numerologia sagrada e tarô simbólico. Nenhuma consulta deve ser considerada como certeza fática irrefutável ou garantia de acontecimentos futuros.
+                  O Exu Responde é uma plataforma de orientação, discernimento e sabedoria ancestral baseada nas tradições de Ifá, oráculos dos Odùs, numerologia sagrada e tarô dos caminhos. Nenhuma consulta deve ser considerada como certeza fática irrefutável ou garantia de acontecimentos futuros.
                 </p>
                 <h4 className="text-xs font-bold text-amber-200 uppercase font-mono">3. Sistema de Créditos de Axé</h4>
                 <p>
-                  As consultas e oráculos utilizam créditos virtuais ("Créditos de Axé"). Os créditos podem ser adquiridos via pacotes transparentes processados com segurança pelo Mercado Pago. Créditos consumidos em consultas completas concluídas com sucesso não são reembolsáveis. Em casos de instabilidade técnica confirmada da inteligência artificial onde a consulta não retorne resposta válida, o saldo de créditos é preservado ou estornado automaticamente.
+                  As consultas e oráculos utilizam créditos virtuais ("Créditos de Axé"). Os créditos podem ser adquiridos via pacotes transparentes processados com segurança pelo Mercado Pago. Créditos consumidos em consultas completas concluídas com sucesso não são reembolsáveis. Em casos de instabilidade técnica confirmada do sistema onde a consulta não retorne resposta válida, o saldo de créditos é preservado ou estornado automaticamente.
                 </p>
                 <h4 className="text-xs font-bold text-amber-200 uppercase font-mono">4. Elegibilidade e Conduta</h4>
                 <p>
@@ -107,7 +107,7 @@ export default function LegalModal({ initialTab = "termos", isOpen, onClose }: L
                 </p>
                 <h4 className="text-xs font-bold text-amber-200 uppercase font-mono">1. Dados Natais e Finalidade</h4>
                 <p>
-                  Coletamos seu nome completo de batismo/solteiro, data e hora de nascimento exclusivamente para calcular a matriz espiritual, o Odù de afinidade simbólica e as coordenadas numerológicas personalizadas da sua consulta. Esses dados constituem sua "assinatura natal espiritual" permanente e nunca são comercializados com terceiros.
+                  Coletamos seu nome completo de batismo/solteiro, data e hora de nascimento exclusivamente para calcular a matriz espiritual, o Odù de afinidade ancestral e as coordenadas numerológicas personalizadas da sua consulta. Esses dados constituem sua "assinatura natal espiritual" permanente e nunca são comercializados com terceiros.
                 </p>
                 <h4 className="text-xs font-bold text-amber-200 uppercase font-mono">2. Dados de Terceiros</h4>
                 <p>

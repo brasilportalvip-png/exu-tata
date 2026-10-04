@@ -10,21 +10,51 @@
     <priority>1.0</priority>
   </url>
   <url>
-    <loc>https://exu-responde.vercel.app/?view=termos</loc>
+    <loc>https://exu-responde.vercel.app/termos</loc>
     <lastmod>2026-10-04</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.7</priority>
   </url>
   <url>
-    <loc>https://exu-responde.vercel.app/?view=privacidade</loc>
+    <loc>https://exu-responde.vercel.app/privacidade</loc>
     <lastmod>2026-10-04</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.7</priority>
   </url>
   <url>
-    <loc>https://exu-responde.vercel.app/?view=responsabilidade</loc>
+    <loc>https://exu-responde.vercel.app/cookies</loc>
     <lastmod>2026-10-04</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
+  </url>
+  <url>
+    <loc>https://exu-responde.vercel.app/pagamentos-creditos</loc>
+    <lastmod>2026-10-04</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>
+  <url>
+    <loc>https://exu-responde.vercel.app/reembolso</loc>
+    <lastmod>2026-10-04</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.6</priority>
+  </url>
+  <url>
+    <loc>https://exu-responde.vercel.app/responsabilidade</loc>
+    <lastmod>2026-10-04</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.6</priority>
+  </url>
+  <url>
+    <loc>https://exu-responde.vercel.app/lgpd</loc>
+    <lastmod>2026-10-04</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>
+  <url>
+    <loc>https://exu-responde.vercel.app/contato</loc>
+    <lastmod>2026-10-04</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
   </url>
 </urlset>
