@@ -1,0 +1,59 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // DENY ALL by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Regras da Coleção de Usuários
+    match /users/{userId} {
+      // O próprio usuário autenticado pode ler seu perfil
+      allow read: if request.auth != null && request.auth.uid == resource.data.firebaseUid;
+
+      // O cliente NÃO pode alterar créditos, cargos, flags de segurança ou bloqueio
+      // Somente atualizações de dados cadastrais básicos de perfil sem alterar créditos/role
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.firebaseUid
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['credits', 'role', 'isAdmin', 'isBlocked', 'fraudScore', 'promotionalCreditsBlocked', 'fraudReasons']);
+
+      // Criação inicial é mediada pela API do servidor
+      allow create, delete: if false;
+    }
+
+    // Regras de Mensagens / Consultas
+    match /messages/{messageId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+      // Criação e edição de mensagens apenas pelo servidor autenticado
+      allow write: if false;
+    }
+
+    // Acervo de Sabedoria / Biblioteca
+    match /knowledge/{itemId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Coleções Críticas: Exclusivas do Servidor (Firebase Admin SDK)
+    match /payments/{paymentId} {
+      allow read, write: if false;
+    }
+
+    match /webhook_logs/{logId} {
+      allow read, write: if false;
+    }
+
+    match /webhook_errors/{errorId} {
+      allow read, write: if false;
+    }
+
+    match /activity_logs/{logId} {
+      allow read, write: if false;
+    }
+
+    match /security_logs/{logId} {
+      allow read, write: if false;
+    }
+  }
+}
