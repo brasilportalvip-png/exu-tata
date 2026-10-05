@@ -315,7 +315,16 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: "256kb" }));
-app.use(createAppCheckMiddleware(getApps().length ? getApps()[0] : null));
+app.use(
+  createAppCheckMiddleware(() => {
+    try {
+      initializeFirebaseAdmin();
+    } catch {
+      // Ignore
+    }
+    return getApps().length ? getApps()[0] : null;
+  })
+);
 
 app.get("/api/health", (_req, res) => {
   const isProd = checkIsProduction();
@@ -474,73 +483,7 @@ async function checkDurableRateLimit(
   maxRequests: number,
   windowMs: number
 ): Promise<boolean> {
-  const now = Date.now();
-
-  // 1. Verificação local em memória (Resposta imediata)
-  let timestamps = inMemoryRateLimits.get(rawKey) || [];
-  timestamps = timestamps.filter((t) => now - t < windowMs);
-
-  if (timestamps.length >= maxRequests) {
-    inMemoryRateLimits.set(rawKey, timestamps);
-    return false;
-  }
-
-  timestamps.push(now);
-  inMemoryRateLimits.set(rawKey, timestamps);
-
-  if (inMemoryRateLimits.size > 3000) {
-    for (const [k, ts] of inMemoryRateLimits.entries()) {
-      if (ts.every((t) => now - t > windowMs)) {
-        inMemoryRateLimits.delete(k);
-      }
-    }
-  }
-
-  // 2. Persistência durável compartilhada no Firestore com hash anônimo (Minimização de IP)
-  try {
-    if (firestore && typeof firestore.collection === "function") {
-      const hashedKey = crypto
-        .createHash("sha256")
-        .update(rawKey)
-        .digest("hex")
-        .slice(0, 32);
-
-      const limitRef = firestore.collection("rate_limits").doc(hashedKey);
-      const doc = await limitRef.get();
-
-      if (doc.exists) {
-        const data = doc.data() || {};
-        const resetAt = Number(data.resetAt || 0);
-        const count = Number(data.count || 0);
-
-        if (resetAt > now) {
-          if (count >= maxRequests) {
-            return false;
-          }
-          await limitRef.update({
-            count: count + 1,
-            updatedAt: now
-          });
-        } else {
-          await limitRef.set({
-            count: 1,
-            resetAt: now + windowMs,
-            updatedAt: now
-          });
-        }
-      } else {
-        await limitRef.set({
-          count: 1,
-          resetAt: now + windowMs,
-          updatedAt: now
-        });
-      }
-    }
-  } catch (_err) {
-    // Resiliente a falhas temporárias do Firestore; controle em memória garante a proteção local
-  }
-
-  return true;
+  return checkAtomicDurableRateLimit(firestore, rawKey, maxRequests, windowMs);
 }
 
 // ======================================================
@@ -740,71 +683,12 @@ async function generateWithGeminiFallback(params: {
 
 // Low-cost fallback logic if Gemini fails or is unconfigured to preserve premium interface
 
-function getBrazilDateTime(): any {
+function getBrazilDateTime(requestedTimeZone?: string): any {
+  const dtCtx = getUserDateTimeContext(requestedTimeZone);
   const now = new Date();
 
-  const formatter = new Intl.DateTimeFormat("pt-BR", {
-    timeZone: "America/Sao_Paulo",
-    weekday: "long",
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  });
-
-  const parts = formatter.formatToParts(now);
-  const getPart = (type: string) => parts.find((p) => p.type === type)?.value || "";
-
-  const day = getPart("day");
-  const month = getPart("month");
-  const year = getPart("year");
-  const hour = parseInt(getPart("hour"), 10) || 0;
-  const minute = getPart("minute");
-  const weekdayName = getPart("weekday");
-
-  const formattedDate = `${day}/${month}/${year}`;
-  const formattedTime = `${String(hour).padStart(2, "0")}:${minute}`;
-
-  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-  const tomorrowFmt = new Intl.DateTimeFormat("pt-BR", {
-    timeZone: "America/Sao_Paulo",
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    weekday: "long"
-  }).format(tomorrow);
-
-  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const yesterdayFmt = new Intl.DateTimeFormat("pt-BR", {
-    timeZone: "America/Sao_Paulo",
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    weekday: "long"
-  }).format(yesterday);
-
-  let periodOfDay: "madrugada" | "manhã" | "tarde" | "noite" = "noite";
-  let greeting = "Boa noite";
-
-  if (hour >= 0 && hour < 6) {
-    periodOfDay = "madrugada";
-    greeting = "Boa madrugada";
-  } else if (hour >= 6 && hour < 12) {
-    periodOfDay = "manhã";
-    greeting = "Bom dia";
-  } else if (hour >= 12 && hour < 18) {
-    periodOfDay = "tarde";
-    greeting = "Boa tarde";
-  } else {
-    periodOfDay = "noite";
-    greeting = "Boa noite";
-  }
-
   const dayIndex = new Date(
-    now.toLocaleString("en-US", { timeZone: "America/Sao_Paulo" })
+    now.toLocaleString("en-US", { timeZone: dtCtx.timeZone })
   ).getDay();
 
   const regencies: Record<number, {
@@ -882,14 +766,17 @@ function getBrazilDateTime(): any {
   };
 
   return {
-    dateStr: `${weekdayName}, ${formattedDate} às ${formattedTime}`,
-    formattedDate,
-    formattedTime,
-    periodOfDay,
-    greeting,
-    weekdayName,
-    tomorrowDateStr: tomorrowFmt,
-    yesterdayDateStr: yesterdayFmt,
+    timeZone: dtCtx.timeZone,
+    formattedDate: dtCtx.formattedDate,
+    formattedTime: dtCtx.formattedTime,
+    weekdayName: dtCtx.weekdayName,
+    dateStr: dtCtx.dateStr,
+    tomorrowDateStr: dtCtx.tomorrowDateStr,
+    yesterdayDateStr: dtCtx.yesterdayDateStr,
+    periodOfDay: dtCtx.periodOfDay,
+    greeting: dtCtx.greeting,
+    year: dtCtx.year,
+    dayIndex,
     ...regencies[dayIndex]
   };
 }
@@ -2480,6 +2367,13 @@ app.post(
   "/api/auth/register",
   requireFirebaseAuth,
   async (req, res) => {
+    const parseResult = registerBodySchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: parseResult.error.errors[0]?.message || "Dados de cadastro inválidos."
+      });
+    }
+
     const {
       birthName,
       birthDate,
@@ -2489,8 +2383,12 @@ app.post(
       deviceId,
       browser,
       session,
-      honeypot
-    } = req.body;
+      honeypot,
+      termsAccepted,
+      privacyAccepted,
+      termsVersion,
+      privacyVersion
+    } = parseResult.data;
 
     const firebaseUser = (req as any).firebaseUser as DecodedIdToken;
 
@@ -2527,15 +2425,7 @@ app.post(
       });
     }
 
-    const placeToUseSubmit =
-      birthPlace || "Não informada";
-
-    if (!submittedEmail || !birthName || !birthDate) {
-      return res.status(400).json({
-        error:
-          "Faltam campos obrigatórios no cadastro sagrado."
-      });
-    }
+    const placeToUseSubmit = birthPlace ? birthPlace.trim() : "";
 
     if (submittedEmail !== firebaseEmail) {
       return res.status(403).json({
@@ -2714,10 +2604,10 @@ Você DEVE estruturar o relatório obrigatoriamente utilizando Markdown com as s
 - Número de destino: ${newUser.destinyNumber}
 - Número da alma: ${newUser.soulNumber}
 - Número de expressão: ${newUser.expressionNumber}
-- Ano pessoal (calendário 2026): ${newUser.personalYear}
+- Ano pessoal (calendário ${new Date().getFullYear()}): ${newUser.personalYear}
 
 ### PERFIL ASTROLÓGICO
-- Signo solar: ${newUser.sunSign || "Áries"}
+- Signo solar: ${newUser.signoSolar || "Áries"}
 - Influências planetárias dominantes
 
 ### RESUMO DOS DESTINOS
@@ -2765,7 +2655,7 @@ Você DEVE estruturar o relatório obrigatoriamente utilizando Markdown com as s
 
     return res.json({
       success: true,
-      user: newUser,
+      user: toPublicUserDTO(newUser.id, newUser),
       requiresEmailVerification: !isEmailVerified
     });
   }
@@ -2903,10 +2793,7 @@ app.post(
 
     return res.json({
       success: true,
-      user: {
-        id: refreshedDoc.id,
-        ...refreshedDoc.data()
-      }
+      user: toPublicUserDTO(refreshedDoc.id, refreshedDoc.data() || {})
     });
   }
 );

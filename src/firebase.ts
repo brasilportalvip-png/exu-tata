@@ -1,5 +1,12 @@
 import { initializeApp, type FirebaseApp } from "firebase/app";
 import {
+  initializeAppCheck,
+  ReCaptchaV3Provider,
+  CustomProvider,
+  getToken,
+  type AppCheck,
+} from "firebase/app-check";
+import {
   getAuth,
   onAuthStateChanged as fbOnAuthStateChanged,
   signOut as fbSignOut,
@@ -109,13 +116,45 @@ function notifyListeners() {
 
 let app: FirebaseApp | null = null;
 let realAuth: Auth | null = null;
+let appCheck: AppCheck | null = null;
 
 if (isFirebaseConfigured) {
   try {
     app = initializeApp(firebaseConfig);
     realAuth = getAuth(app);
+
+    if (typeof window !== "undefined") {
+      const recaptchaKey = env.VITE_RECAPTCHA_SITE_KEY || "";
+      if (recaptchaKey) {
+        appCheck = initializeAppCheck(app, {
+          provider: new ReCaptchaV3Provider(recaptchaKey),
+          isTokenAutoRefreshEnabled: true,
+        });
+      } else if (!isProduction) {
+        appCheck = initializeAppCheck(app, {
+          provider: new CustomProvider({
+            getToken: async () => ({
+              token: "dev_app_check_token_" + Math.random().toString(36).substring(2),
+              expireTimeMillis: Date.now() + 3600 * 1000,
+            }),
+          }),
+          isTokenAutoRefreshEnabled: true,
+        });
+      }
+    }
   } catch (err) {
-    console.error("[Firebase] Falha ao inicializar Firebase Auth do cliente:", err);
+    console.error("[Firebase] Falha ao inicializar Firebase Auth / App Check do cliente:", err);
+  }
+}
+
+export async function getClientAppCheckToken(): Promise<string | null> {
+  if (!appCheck) return null;
+  try {
+    const result = await getToken(appCheck, false);
+    return result?.token || null;
+  } catch (err) {
+    console.warn("[AppCheck] Falha ao obter token:", err);
+    return null;
   }
 }
 

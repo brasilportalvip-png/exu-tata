@@ -51,8 +51,8 @@ export async function verifyAppCheckToken(
   }
 }
 
-export function createAppCheckMiddleware(firebaseAdminApp: any) {
-  const isEnforced = process.env.ENFORCE_APP_CHECK === "true";
+export function createAppCheckMiddleware(getFirebaseApp?: any) {
+  const isEnforced = () => process.env.ENFORCE_APP_CHECK === "true";
 
   return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     // Isenção explícita para health check e webhook oficial do Mercado Pago
@@ -63,11 +63,16 @@ export function createAppCheckMiddleware(firebaseAdminApp: any) {
       return next();
     }
 
+    const appInstance =
+      typeof getFirebaseApp === "function"
+        ? getFirebaseApp()
+        : getFirebaseApp || (getApps().length ? getApps()[0] : null);
+
     const appCheckToken = req.headers["x-firebase-appcheck"] as string | undefined;
-    const result = await verifyAppCheckToken(firebaseAdminApp, appCheckToken);
+    const result = await verifyAppCheckToken(appInstance, appCheckToken);
 
     if (!result.valid) {
-      if (isEnforced) {
+      if (isEnforced()) {
         return res.status(401).json({
           error: "Requisição não autorizada pelo sistema antibot (App Check).",
           code: "APP_CHECK_FAILED",
