@@ -52,11 +52,7 @@ export default function PremiumCredits({ user }: PremiumCreditsProps) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-
-          // Compatibilidade temporária com a rota atual do server.ts.
-          // Será removido quando a proteção consolidada do backend for aplicada.
-          "x-user-id": user.id
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           planId: plan.id,

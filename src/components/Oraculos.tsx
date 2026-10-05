@@ -88,8 +88,7 @@ export default function Oraculos({ user, onUpdateUser, openCreditsMenu }: Oracul
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-          "x-user-id": user.id
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           question: buziosQuestion
@@ -156,8 +155,7 @@ export default function Oraculos({ user, onUpdateUser, openCreditsMenu }: Oracul
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-          "x-user-id": user.id
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           question: tarotQuestion,
@@ -229,8 +227,7 @@ export default function Oraculos({ user, onUpdateUser, openCreditsMenu }: Oracul
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-          "x-user-id": user.id
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           birthName: numName,
@@ -291,8 +288,7 @@ export default function Oraculos({ user, onUpdateUser, openCreditsMenu }: Oracul
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-          "x-user-id": user.id
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           birthDate: targetDate

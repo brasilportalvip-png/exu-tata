@@ -60,29 +60,33 @@ export function getUserDateTimeContext(requestedTimeZone?: string): UserDateTime
     greeting = "Boa madrugada";
   }
 
-  // Operação de calendário real (sem adicionar cegamente 24 horas por conta de DST / fuso)
-  const tomorrow = new Date(now.getTime() + 26 * 60 * 60 * 1000);
+  // Aritmética de calendário pura: extrai o dia civil local e opera em UTC ao meio-dia (imune a DST e variações de fuso)
+  const curCalDate = new Date(Date.UTC(parseInt(yearStr, 10), parseInt(month, 10) - 1, parseInt(day, 10), 12, 0, 0));
+
+  const tomorrowCalDate = new Date(curCalDate);
+  tomorrowCalDate.setUTCDate(curCalDate.getUTCDate() + 1);
   const tomorrowParts = new Intl.DateTimeFormat("pt-BR", {
-    timeZone,
+    timeZone: "UTC",
     day: "2-digit",
     month: "2-digit",
     year: "numeric",
     weekday: "long",
-  }).formatToParts(tomorrow);
+  }).formatToParts(tomorrowCalDate);
   const tDay = tomorrowParts.find((p) => p.type === "day")?.value || "";
   const tMonth = tomorrowParts.find((p) => p.type === "month")?.value || "";
   const tYear = tomorrowParts.find((p) => p.type === "year")?.value || "";
   const tWeekday = tomorrowParts.find((p) => p.type === "weekday")?.value || "";
   const tomorrowDateStr = `${tWeekday}, ${tDay}/${tMonth}/${tYear}`;
 
-  const yesterday = new Date(now.getTime() - 26 * 60 * 60 * 1000);
+  const yesterdayCalDate = new Date(curCalDate);
+  yesterdayCalDate.setUTCDate(curCalDate.getUTCDate() - 1);
   const yesterdayParts = new Intl.DateTimeFormat("pt-BR", {
-    timeZone,
+    timeZone: "UTC",
     day: "2-digit",
     month: "2-digit",
     year: "numeric",
     weekday: "long",
-  }).formatToParts(yesterday);
+  }).formatToParts(yesterdayCalDate);
   const yDay = yesterdayParts.find((p) => p.type === "day")?.value || "";
   const yMonth = yesterdayParts.find((p) => p.type === "month")?.value || "";
   const yYear = yesterdayParts.find((p) => p.type === "year")?.value || "";

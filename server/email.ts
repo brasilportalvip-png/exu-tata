@@ -37,6 +37,15 @@ function getTransporter() {
   });
 }
 
+export function escapeHtml(str: string): string {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 export async function queueAndSendPurchaseEmails(
   firestore: any,
   params: {
@@ -51,47 +60,54 @@ export async function queueAndSendPurchaseEmails(
     approvedAt: string;
   }
 ): Promise<{ customerSent: boolean; adminSent: boolean }> {
-  const adminEmail = process.env.ADMIN_SALES_EMAIL || "brasilportalvip@gmail.com";
-  const fromEmail = process.env.EMAIL_FROM || "Exu Responde <contato@exu-responde.com>";
+  const adminEmail = process.env.ADMIN_SALES_EMAIL?.trim() || "";
+  const fromEmail = process.env.EMAIL_FROM?.trim() || "Exu Responde <contato@exu-responde.com>";
+
+  const customerNameSafe = escapeHtml(params.customerName);
+  const planNameSafe = escapeHtml(params.planName);
+  const customerEmailSafe = escapeHtml(params.customerEmail);
+  const paymentIdSafe = escapeHtml(params.paymentId);
+  const orderIdSafe = escapeHtml(params.orderId);
+  const approvedAtSafe = escapeHtml(params.approvedAt);
 
   const customerEmailId = `purchase_customer_${params.paymentId}`;
   const adminEmailId = `purchase_admin_${params.paymentId}`;
 
   const transporter = getTransporter();
 
-  // 1. Template do Comprador
+  // 1. Template do Comprador com escaping rigoroso
   const customerHtml = `
     <div style="font-family: Arial, sans-serif; background: #09090b; color: #f4f4f5; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #3f3f46;">
       <h2 style="color: #ef4444; margin-top: 0;">🔱 Exu Responde — Confirmação de Axé</h2>
-      <p>Salve, <strong>${params.customerName}</strong>!</p>
+      <p>Salve, <strong>${customerNameSafe}</strong>!</p>
       <p>Sua aquisição de Axé foi confirmada com sucesso em nossos caminhos.</p>
       <div style="background: #18181b; padding: 16px; border-radius: 8px; margin: 16px 0; border: 1px solid #27272a;">
-        <p style="margin: 4px 0;"><strong>Plano:</strong> ${params.planName}</p>
+        <p style="margin: 4px 0;"><strong>Plano:</strong> ${planNameSafe}</p>
         <p style="margin: 4px 0;"><strong>Créditos adicionados:</strong> +${params.credits} Axé</p>
         <p style="margin: 4px 0;"><strong>Valor pago:</strong> R$ ${params.amount.toFixed(2)}</p>
         <p style="margin: 4px 0;"><strong>Novo saldo disponível:</strong> ${params.newBalance} Axé</p>
-        <p style="margin: 4px 0;"><strong>Identificador da Transação:</strong> ${params.paymentId}</p>
-        <p style="margin: 4px 0;"><strong>Data de Confirmação:</strong> ${params.approvedAt}</p>
+        <p style="margin: 4px 0;"><strong>Identificador da Transação:</strong> ${paymentIdSafe}</p>
+        <p style="margin: 4px 0;"><strong>Data de Confirmação:</strong> ${approvedAtSafe}</p>
       </div>
       <p style="font-size: 13px; color: #a1a1aa;">Seus créditos já estão disponíveis em seu perfil para consultas de oráculos e leituras sagradas.</p>
       <p style="font-size: 12px; color: #71717a; margin-top: 24px;">Em caso de dúvidas ou necessidade de suporte, responda a este e-mail.</p>
     </div>
   `;
 
-  // 2. Template do Administrador
+  // 2. Template do Administrador com escaping rigoroso
   const adminHtml = `
     <div style="font-family: Arial, sans-serif; background: #0f172a; color: #f8fafc; padding: 24px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
       <h3 style="color: #38bdf8; margin-top: 0;">🔔 Nova Venda Aprovada — Exu Responde</h3>
       <p>Uma nova compra de créditos foi processada e confirmada via Mercado Pago.</p>
       <div style="background: #1e293b; padding: 16px; border-radius: 8px; margin: 16px 0;">
-        <p style="margin: 4px 0;"><strong>Comprador:</strong> ${params.customerName} (${params.customerEmail})</p>
-        <p style="margin: 4px 0;"><strong>Plano:</strong> ${params.planName}</p>
+        <p style="margin: 4px 0;"><strong>Comprador:</strong> ${customerNameSafe} (${customerEmailSafe})</p>
+        <p style="margin: 4px 0;"><strong>Plano:</strong> ${planNameSafe}</p>
         <p style="margin: 4px 0;"><strong>Valor:</strong> R$ ${params.amount.toFixed(2)}</p>
         <p style="margin: 4px 0;"><strong>Créditos Concedidos:</strong> +${params.credits} Axé</p>
         <p style="margin: 4px 0;"><strong>Saldo Atual do Usuário:</strong> ${params.newBalance} Axé</p>
-        <p style="margin: 4px 0;"><strong>Payment ID:</strong> ${params.paymentId}</p>
-        <p style="margin: 4px 0;"><strong>Order ID:</strong> ${params.orderId}</p>
-        <p style="margin: 4px 0;"><strong>Horário:</strong> ${params.approvedAt}</p>
+        <p style="margin: 4px 0;"><strong>Payment ID:</strong> ${paymentIdSafe}</p>
+        <p style="margin: 4px 0;"><strong>Order ID:</strong> ${orderIdSafe}</p>
+        <p style="margin: 4px 0;"><strong>Horário:</strong> ${approvedAtSafe}</p>
       </div>
     </div>
   `;
@@ -186,4 +202,61 @@ export async function queueAndSendPurchaseEmails(
   }
 
   return { customerSent, adminSent };
+}
+
+export async function processPendingOutboxEmails(
+  firestore: any
+): Promise<{ processed: number; sent: number; failed: number }> {
+  if (!firestore || !isEmailConfigured()) {
+    return { processed: 0, sent: 0, failed: 0 };
+  }
+
+  const transporter = getTransporter();
+  if (!transporter) return { processed: 0, sent: 0, failed: 0 };
+
+  const fromEmail = process.env.EMAIL_FROM?.trim() || "Exu Responde <contato@exu-responde.com>";
+
+  const snap = await firestore
+    .collection("email_outbox")
+    .where("status", "in", ["pending", "failed"])
+    .limit(10)
+    .get();
+
+  let sent = 0;
+  let failed = 0;
+
+  for (const doc of snap.docs) {
+    const item = doc.data() as OutboxEmailRecord;
+    const currentAttempts = Number(item.attempts || 1);
+
+    if (currentAttempts >= 5) {
+      continue; // Excedeu tentativas máximas
+    }
+
+    try {
+      await transporter.sendMail({
+        from: fromEmail,
+        to: item.recipient,
+        subject: item.subject,
+        html: item.htmlContent || `<p>Notificação oficial de Axé do Exu Responde para a transação ${item.paymentId}.</p>`,
+      });
+
+      await doc.ref.update({
+        status: "sent",
+        sentAt: new Date().toISOString(),
+        attempts: currentAttempts + 1,
+        lastError: null,
+      });
+      sent++;
+    } catch (err: any) {
+      failed++;
+      await doc.ref.update({
+        status: "failed",
+        attempts: currentAttempts + 1,
+        lastError: err.message || String(err),
+      });
+    }
+  }
+
+  return { processed: snap.size, sent, failed };
 }

@@ -111,8 +111,7 @@ const SESSION_KEY = "exu_responde_chat_session";
 
         const profileRes = await fetch("/api/user/profile", {
           headers: {
-            "Authorization": `Bearer ${token}`,
-            "x-user-id": restoredUser.id
+            "Authorization": `Bearer ${token}`
           }
         });
 
@@ -214,8 +213,7 @@ const SESSION_KEY = "exu_responde_chat_session";
 
       const profileRes = await fetch("/api/user/profile", {
         headers: {
-          "Authorization": `Bearer ${token}`,
-          "x-user-id": loggedInUser.id
+          "Authorization": `Bearer ${token}`
         }
       });
 
@@ -321,8 +319,7 @@ const SESSION_KEY = "exu_responde_chat_session";
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-          "x-user-id": user.id
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           text: question,
@@ -924,6 +921,7 @@ setUser({
         {/* ENTRANCE REGISTER / LOGIN MODAL */}
         {showEntranceModal && (
           <motion.div
+            key="entrance_modal"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -955,6 +953,7 @@ setUser({
         {/* PROFILE DETAILED DRAWER */}
         {activeModal === "profile" && user && (
           <motion.div
+            key="profile_drawer"
             initial={{ y: "100%" }}
             animate={{ y: 0 }}
             exit={{ y: "100%" }}
@@ -990,6 +989,7 @@ setUser({
         {/* ORACLES MODAL DRAWER */}
         {activeModal === "oracles" && user && (
           <motion.div
+            key="oracles_drawer"
             initial={{ y: "100%" }}
             animate={{ y: 0 }}
             exit={{ y: "100%" }}
@@ -1026,6 +1026,7 @@ setUser({
         {/* PREMIUM PACKAGES RECHARGES DRAWER */}
         {activeModal === "credits" && user && (
           <motion.div
+            key="credits_drawer"
             initial={{ y: "100%" }}
             animate={{ y: 0 }}
             exit={{ y: "100%" }}
@@ -1065,11 +1066,10 @@ setUser({
           </motion.div>
         )}
 
-
-
         {/* ADMINISTRATIVE AUDITING CONTROL PANEL */}
         {activeModal === "admin" && user && user.role === "admin" && (
           <motion.div
+            key="admin_drawer"
             initial={{ y: "100%" }}
             animate={{ y: 0 }}
             exit={{ y: "100%" }}
@@ -1099,66 +1099,65 @@ setUser({
           </motion.div>
         )}
 
+        {/* SUPPORT MODAL */}
+        {showSupportModal && (
+          <motion.div
+            key="support_modal"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[99999] bg-black/85 backdrop-blur-md flex items-center justify-center p-4"
+          >
+            <div className="w-full max-w-sm rounded-3xl border border-yellow-500/30 bg-zinc-950 p-5 shadow-[0_0_35px_rgba(234,179,8,0.25)]">
+              <h2 className="mb-5 text-center text-lg font-black text-yellow-400 tracking-widest">
+                SUPORTE
+              </h2>
 
-{showSupportModal && (
-  <motion.div
-    initial={{ opacity: 0 }}
-    animate={{ opacity: 1 }}
-    exit={{ opacity: 0 }}
-    className="fixed inset-0 z-[99999] bg-black/85 backdrop-blur-md flex items-center justify-center p-4"
-  >
-    <div className="w-full max-w-sm rounded-3xl border border-yellow-500/30 bg-zinc-950 p-5 shadow-[0_0_35px_rgba(234,179,8,0.25)]">
-      <h2 className="mb-5 text-center text-lg font-black text-yellow-400 tracking-widest">
-        SUPORTE
-      </h2>
+              <button
+                type="button"
+                onClick={() =>
+                  window.open(
+                    "https://chat.whatsapp.com/JqXdWPrCVxz1NC9dXyMdso?s=cl&p=a&ilr=2&amv=1",
+                    "_blank"
+                  )
+                }
+                className="mb-4 w-full rounded-2xl bg-green-600 py-4 font-bold text-white"
+              >
+                🟢 Entrar no WhatsApp
+              </button>
 
-      <button
-        type="button"
-        onClick={() =>
-          window.open(
-            "https://chat.whatsapp.com/JqXdWPrCVxz1NC9dXyMdso?s=cl&p=a&ilr=2&amv=1",
-            "_blank"
-          )
-        }
-        className="mb-4 w-full rounded-2xl bg-green-600 py-4 font-bold text-white"
-      >
-        🟢 Entrar no WhatsApp
-      </button>
+              <button
+                type="button"
+                onClick={() =>
+                  window.open(
+                    "https://t.me/+EOUhr0Xa2_00NDQ5",
+                    "_blank"
+                  )
+                }
+                className="mb-4 w-full rounded-2xl bg-sky-600 py-4 font-bold text-white"
+              >
+                🔵 Entrar no Telegram
+              </button>
 
-      <button
-        type="button"
-        onClick={() =>
-          window.open(
-            "https://t.me/+EOUhr0Xa2_00NDQ5",
-            "_blank"
-          )
-        }
-        className="mb-4 w-full rounded-2xl bg-sky-600 py-4 font-bold text-white"
-      >
-        🔵 Entrar no Telegram
-      </button>
-
-      <button
-        type="button"
-        onClick={() => setShowSupportModal(false)}
-        className="w-full rounded-2xl bg-red-700 py-3 font-bold text-white"
-      >
-        Fechar
-      </button>
-    </div>
-  </motion.div>
-)}
-
-
-
-        {/* Global Legal Modal */}
-        <LegalModal
-          isOpen={legalModalOpen}
-          initialTab={legalModalTab}
-          onClose={() => setLegalModalOpen(false)}
-        />
+              <button
+                type="button"
+                onClick={() => setShowSupportModal(false)}
+                className="w-full rounded-2xl bg-red-700 py-3 font-bold text-white"
+              >
+                Fechar
+              </button>
+            </div>
+          </motion.div>
+        )}
 
       </AnimatePresence>
+
+      {/* Global Legal Modal */}
+      <LegalModal
+        isOpen={legalModalOpen}
+        initialTab={legalModalTab}
+        onClose={() => setLegalModalOpen(false)}
+      />
     </main>
   );
 }

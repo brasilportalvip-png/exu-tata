@@ -8,6 +8,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { Send, Sparkles, MessageSquare, Compass, Shield, Flame, BookOpen, Volume2 } from "lucide-react";
 import { AudioEngine } from "./AudioEngine";
 import { UserProfile, ChatMessage } from "../types";
+import { auth } from "../firebase";
 
 interface TerreiroChatProps {
   user: UserProfile;
@@ -77,12 +78,18 @@ export default function TerreiroChat({ user, initialChats = [], onUpdateUser, op
     setMessages(prev => [...prev, userMsg]);
 
     try {
+      const firebaseUser = auth.currentUser;
+      const token = firebaseUser ? await firebaseUser.getIdToken() : "";
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json"
+      };
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
       const res = await fetch("/api/exu/chat", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-user-id": user.id
-        },
+        headers,
         body: JSON.stringify({ text: textToSend, type: consultationType })
       });
 
@@ -300,7 +307,7 @@ export default function TerreiroChat({ user, initialChats = [], onUpdateUser, op
         <div className="flex gap-2 overflow-x-auto pb-1.5 select-none scrollbar-thin scrollbar-thumb-zinc-800 scrollbar-track-transparent">
           {TEMPLE_SUGGESTIONS.map((sug, idx) => (
             <button
-              key={idx}
+              key={`temple_sug_${idx}`}
               onClick={() => handleSuggestionClick(sug)}
               disabled={loading}
               className="text-xs bg-zinc-950 hover:bg-red-950/20 border border-red-950 px-3 py-1.5 rounded-lg text-amber-200/80 hover:text-amber-100 hover:border-yellow-600/40 shrink-0 select-none cursor-pointer transition-all duration-300 disabled:opacity-50"

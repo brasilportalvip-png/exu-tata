@@ -15,29 +15,21 @@ export interface CreditPlanServer {
 
 export const CREDIT_PLANS: CreditPlanServer[] = [
   {
-    id: "iniciacao",
-    name: "Iniciação nos Caminhos",
-    price: 19.9,
-    credits: 10,
-    bonus: 2,
-    color: "from-zinc-800 to-zinc-900",
+    id: "plan_prata",
+    name: "Plano Prata",
+    price: 49.0,
+    credits: 50,
+    bonus: 0,
+    color: "from-zinc-700 to-zinc-900",
   },
   {
-    id: "ebó",
-    name: "Abertura de Porteira",
-    price: 49.9,
-    credits: 30,
-    bonus: 10,
+    id: "plan_ouro",
+    name: "Plano Ouro",
+    price: 120.0,
+    credits: 125,
+    bonus: 0,
     popular: true,
-    color: "from-red-950/60 to-zinc-900",
-  },
-  {
-    id: "trono",
-    name: "Guardião da Encruzilhada",
-    price: 99.9,
-    credits: 75,
-    bonus: 30,
-    color: "from-yellow-950/40 to-zinc-900",
+    color: "from-yellow-700 via-yellow-600 to-amber-950",
   },
 ];
 

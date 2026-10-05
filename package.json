@@ -13,7 +13,7 @@
     "test": "npm run build:test-api && node --no-experimental-require-module --test test/*.test.mjs"
   },
   "engines": {
-    "node": "24.x"
+    "node": "^22.0.0 || ^24.0.0"
   },
   "overrides": {
     "@grpc/grpc-js": "^1.14.5",

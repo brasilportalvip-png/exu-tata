@@ -51,8 +51,7 @@ export default function AdminPanel({ user }: AdminPanelProps) {
       const token = await firebaseUser.getIdToken();
 
       const hds = {
-        "Authorization": `Bearer ${token}`,
-        "x-user-id": user.id
+        "Authorization": `Bearer ${token}`
       };
 
       const statsRes = await fetch("/api/admin/analytics", {
@@ -134,8 +133,7 @@ export default function AdminPanel({ user }: AdminPanelProps) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-          "x-user-id": user.id
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           title: kbTitle,

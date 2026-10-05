@@ -27,14 +27,18 @@ export interface CreditLedgerRecord {
   reversedAt?: string;
 }
 
-export function calculateSpiritualLevel(xp: number): string {
-  if (xp >= 1500) return "Mestre dos Caminhos";
-  if (xp >= 1000) return "Conhecedor";
-  if (xp >= 600) return "Guardião";
-  if (xp >= 350) return "Iniciado";
-  if (xp >= 180) return "Peregrino";
-  if (xp >= 70) return "Aprendiz";
-  return "Buscador";
+export function calculateSpiritualLevel(xp: number): { level: string; nextThreshold: number } {
+  if (xp < 200) return { level: "Buscador", nextThreshold: 200 };
+  if (xp < 500) return { level: "Aprendiz", nextThreshold: 500 };
+  if (xp < 1200) return { level: "Peregrino", nextThreshold: 1200 };
+  if (xp < 2500) return { level: "Iniciado", nextThreshold: 2500 };
+  if (xp < 5000) return { level: "Guardião", nextThreshold: 5000 };
+  if (xp < 8000) return { level: "Conhecedor", nextThreshold: 8000 };
+  return { level: "Mestre dos Caminhos", nextThreshold: 8000 };
+}
+
+export function getSpiritualLevelName(xp: number): string {
+  return calculateSpiritualLevel(xp).level;
 }
 
 // ======================================================
@@ -132,33 +136,28 @@ export async function executeCreditDebitTransactional(
   const now = new Date().toISOString();
   const rawKey = params.idempotencyKey?.trim() || "";
   const sanitizedKey = rawKey ? rawKey.replace(/[^a-zA-Z0-9_\-]/g, "").substring(0, 128) : "";
+  const keyDocId = sanitizedKey ? crypto.createHash("sha256").update(sanitizedKey).digest("hex") : "";
+  const keyDocRef = keyDocId && firestore ? firestore.collection("idempotency_keys").doc(keyDocId) : null;
 
   return firestore.runTransaction(async (transaction: any) => {
-    // 1. Se foi fornecida idempotencyKey, busca se a operação já foi processada
-    if (sanitizedKey) {
-      const ledgerQuery = await firestore
-        .collection("credit_ledger")
-        .where("idempotencyKey", "==", sanitizedKey)
-        .limit(1)
-        .get();
-
-      if (!ledgerQuery.empty) {
-        const existingRecord = ledgerQuery.docs[0].data() as CreditLedgerRecord;
-
-        if (existingRecord.status === "committed") {
+    // 1. Se foi fornecida idempotencyKey, busca deterministicamente DENTRO da transação
+    if (keyDocRef) {
+      const keySnap = await transaction.get(keyDocRef);
+      if (keySnap.exists) {
+        const keyData = keySnap.data() || {};
+        if (keyData.status === "committed") {
           return {
             isAlreadyCommitted: true,
-            operationId: existingRecord.operationId,
-            balanceBefore: existingRecord.balanceBefore,
-            balanceAfter: existingRecord.balanceAfter,
-            newXp: existingRecord.xpAfter ?? 0,
-            newLevel: existingRecord.levelAfter ?? "Buscador",
-            xpAwarded: existingRecord.xpAwarded ?? 0,
+            operationId: keyData.operationId,
+            balanceBefore: keyData.balanceBefore,
+            balanceAfter: keyData.balanceAfter,
+            newXp: keyData.newXp ?? 0,
+            newLevel: keyData.newLevel ?? "Buscador",
+            xpAwarded: keyData.xpAwarded ?? 0,
           };
         }
-
-        if (existingRecord.status === "processing") {
-          const err: any = new Error("Uma operação idêntica já está em processamento. Aguarde o término.");
+        if (keyData.status === "processing") {
+          const err: any = new Error("Uma operação idêntica já está em processamento. Aguarde.");
           err.status = 409;
           throw err;
         }
@@ -189,7 +188,7 @@ export async function executeCreditDebitTransactional(
     const currentXp = Number(userData.xp || 0);
     const newXp = currentXp + params.xpAwarded;
     const levelBefore = userData.level || "Buscador";
-    const newLevel = calculateSpiritualLevel(newXp);
+    const newLevel = getSpiritualLevelName(newXp);
 
     const operationId = "op_deb_" + crypto.randomUUID();
 
@@ -223,6 +222,22 @@ export async function executeCreditDebitTransactional(
       createdAt: now,
       committedAt: now,
     });
+
+    // 5. Grava documento de idempotência deterministicamente na mesma transação
+    if (keyDocRef) {
+      transaction.set(keyDocRef, {
+        operationId,
+        idempotencyKey: sanitizedKey,
+        userId: userDoc.id,
+        balanceBefore: currentCredits,
+        balanceAfter,
+        newXp,
+        newLevel,
+        xpAwarded: params.xpAwarded,
+        status: "committed",
+        createdAt: now,
+      });
+    }
 
     return {
       isAlreadyCommitted: false,
@@ -304,7 +319,7 @@ export async function executeCreditRefundTransactional(
 
     const balanceAfter = currentCredits + params.amount;
     const newXp = Math.max(0, currentXp - xpToRevert);
-    const newLevel = calculateSpiritualLevel(newXp);
+    const newLevel = getSpiritualLevelName(newXp);
 
     // 3. Atualiza usuário
     transaction.update(params.userRef, {
